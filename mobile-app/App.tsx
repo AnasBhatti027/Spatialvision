@@ -1,6 +1,5 @@
-import React from 'react';
-import SpatialVisionLanding from './components/SpatialVisionLanding';
+import SpatialVisionHome from './components/SpatialVisionHome';
 
 export default function App() {
-  return <SpatialVisionLanding />;
+  return <SpatialVisionHome />;
 }
