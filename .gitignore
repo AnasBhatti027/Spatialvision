@@ -1,0 +1,21 @@
+# Node / Expo
+node_modules/
+.expo/
+dist/
+
+# Python
+venv/
+__pycache__/
+*.pyc
+.env
+*.db
+
+# Android
+build/
+.gradle/
+local.properties
+.idea/
+
+# OS
+Thumbs.db
+.DS_Store
