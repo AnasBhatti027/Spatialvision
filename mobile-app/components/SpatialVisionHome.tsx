@@ -114,7 +114,7 @@ export default function SpatialVisionHome() {
 
   return (
     <SafeAreaView style={styles.container}>
-      <StatusBar barStyle="light-content" backgroundColor={C.bg} />
+      <StatusBar barStyle="light-content" />
 
       <View style={styles.header}>
         <View style={styles.brand}>
