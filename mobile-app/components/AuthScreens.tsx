@@ -8,9 +8,17 @@ type Theme = {
   dark: boolean; bg: string; s1: string; s2: string; blue: string; cyan: string; violet: string;
   text: string; mute: string; line: string; err: string;
 };
-export type AuthUser = { username: string; token?: string; demo?: boolean };
+export type AuthUser = { username: string; token?: string; demo?: boolean; server?: string };
 
-const DEFAULT_SERVER = '192.168.1.20:8000'; // your PC's IP and the backend port
+// In a browser on the same PC the backend is on localhost. On a phone you must type the PC's IP.
+const DEFAULT_SERVER = Platform.OS === 'web' ? 'localhost:8000' : '';
+
+/** Accepts "192.168.10.13:8000", "http://192.168.10.13:8000/" or just "192.168.10.13". */
+export function cleanServer(raw: string): string {
+  let v = raw.trim().replace(/^https?:\/\//i, '').replace(/\/+$/, '');
+  if (v && !/:\d+$/.test(v)) v += ':8000';
+  return v;
+}
 const USER_RE = /^[a-z0-9_]{3,20}$/;
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/;
 const TOP = Platform.OS === 'android' ? (StatusBar.currentHeight ?? 24) : 48;
@@ -41,7 +49,7 @@ async function fetchAvailable(server: string, names: string[]): Promise<string[]
   } catch { return null; }
 }
 
-export default function AuthScreens({ T, onDone }: { T: Theme; onDone: (u: AuthUser) => void }) {
+export default function AuthScreens({ T, onDone, initialServer }: { T: Theme; onDone: (u: AuthUser) => void; initialServer?: string }) {
   const s = useMemo(() => makeStyles(T), [T]);
   const [mode, setMode] = useState<'login' | 'signup'>('login');
   const [email, setEmail] = useState('');
@@ -52,8 +60,9 @@ export default function AuthScreens({ T, onDone }: { T: Theme; onDone: (u: AuthU
   const [show, setShow] = useState(false);
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState('');
-  const [server, setServer] = useState(DEFAULT_SERVER);
-  const [showServer, setShowServer] = useState(false);
+  const [server, setServer] = useState(initialServer || DEFAULT_SERVER);
+  // Open the server box straight away when no address is known yet.
+  const [showServer, setShowServer] = useState(!(initialServer || DEFAULT_SERVER));
   const [sugg, setSugg] = useState<{ name: string; taken: boolean }[]>([]);
   const [known, setKnown] = useState(false);
 
@@ -64,8 +73,10 @@ export default function AuthScreens({ T, onDone }: { T: Theme; onDone: (u: AuthU
     setKnown(false);
     if (!touched && names[0]) setUsername(names[0]);
     let cancelled = false;
+    const addr = cleanServer(server);
+    if (!addr) return;
     const t = setTimeout(async () => {
-      const avail = await fetchAvailable(server.trim(), names);
+      const avail = await fetchAvailable(addr, names);
       if (cancelled || !avail) return;
       setKnown(true);
       setSugg(names.map((n) => ({ name: n, taken: !avail.includes(n) })));
@@ -80,11 +91,13 @@ export default function AuthScreens({ T, onDone }: { T: Theme; onDone: (u: AuthU
     if (mode === 'signup' && !USER_RE.test(username)) return setErr('Username: 3 to 20 characters, lowercase letters, numbers or underscore.');
     if (password.length < 8) return setErr('Password must be at least 8 characters.');
     if (mode === 'signup' && password !== confirm) return setErr('Passwords do not match.');
+    const addr = cleanServer(server);
+    if (!addr) { setShowServer(true); return setErr('Enter your PC address under Server settings first, for example 192.168.10.13:8000.'); }
     setBusy(true);
     try {
       const ctl = new AbortController();
       const t = setTimeout(() => ctl.abort(), 8000);
-      const res = await fetch(`http://${server.trim()}/auth/${mode}`, {
+      const res = await fetch(`http://${addr}/auth/${mode}`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(mode === 'signup' ? { email: em, username, password } : { email: em, password }),
@@ -93,9 +106,10 @@ export default function AuthScreens({ T, onDone }: { T: Theme; onDone: (u: AuthU
       clearTimeout(t);
       const data = await res.json().catch(() => ({}));
       if (!res.ok) setErr(typeof data.detail === 'string' ? data.detail : 'Something went wrong. Try again.');
-      else onDone({ username: data.username ?? username, token: data.token });
+      else onDone({ username: data.username ?? username, token: data.token, server: addr });
     } catch {
-      setErr('Could not reach the server. Check the address under Server settings, and that the backend is running.');
+      setShowServer(true);
+      setErr(`Could not reach the server at ${addr}. Check that the backend is running, the address below is your PC's IPv4 address, and the phone is on the same Wi-Fi.`);
     } finally { setBusy(false); }
   };
 
@@ -141,7 +155,8 @@ export default function AuthScreens({ T, onDone }: { T: Theme; onDone: (u: AuthU
             <Text style={s.label}>Password</Text>
             <View>
               <TextInput style={[s.input, { paddingRight: 48 }]} value={password} onChangeText={setPassword} placeholder="At least 8 characters"
-                placeholderTextColor={T.mute} secureTextEntry={!show} autoCapitalize="none" autoCorrect={false} accessibilityLabel="Password" />
+                placeholderTextColor={T.mute} secureTextEntry={!show} autoCapitalize="none" autoCorrect={false} accessibilityLabel="Password"
+                returnKeyType={mode === 'login' ? 'go' : 'next'} onSubmitEditing={mode === 'login' ? submit : undefined} />
               <Pressable style={s.eye} onPress={() => setShow(!show)} accessibilityLabel={show ? 'Hide password' : 'Show password'}>
                 <Icon name={show ? 'eye-off-outline' : 'eye-outline'} size={22} color={T.mute} />
               </Pressable>
@@ -150,7 +165,8 @@ export default function AuthScreens({ T, onDone }: { T: Theme; onDone: (u: AuthU
             {mode === 'signup' && (<>
               <Text style={s.label}>Confirm password</Text>
               <TextInput style={s.input} value={confirm} onChangeText={setConfirm} placeholder="Repeat password" placeholderTextColor={T.mute}
-                secureTextEntry={!show} autoCapitalize="none" autoCorrect={false} accessibilityLabel="Confirm password" />
+                secureTextEntry={!show} autoCapitalize="none" autoCorrect={false} accessibilityLabel="Confirm password"
+                returnKeyType="go" onSubmitEditing={submit} />
             </>)}
 
             {err ? <Text style={s.error}>{err}</Text> : null}
@@ -172,8 +188,9 @@ export default function AuthScreens({ T, onDone }: { T: Theme; onDone: (u: AuthU
           {showServer && (
             <View style={s.card}>
               <Text style={s.label}>Backend address (PC IP and port)</Text>
-              <TextInput style={s.input} value={server} onChangeText={setServer} placeholder="192.168.1.20:8000" placeholderTextColor={T.mute}
+              <TextInput style={s.input} value={server} onChangeText={setServer} placeholder="e.g. 192.168.10.13:8000" placeholderTextColor={T.mute}
                 autoCapitalize="none" autoCorrect={false} keyboardType="numbers-and-punctuation" accessibilityLabel="Server address" />
+              <Text style={s.hint}>Run ipconfig on the PC and use the Wi-Fi IPv4 address. The app remembers it.</Text>
             </View>
           )}
 
@@ -218,4 +235,4 @@ function makeStyles(T: Theme) {
     btnT: { color: '#FFFFFF', fontSize: 16, fontWeight: '700' },
     switch: { alignItems: 'center', paddingVertical: 14 },
   });
-}
+}

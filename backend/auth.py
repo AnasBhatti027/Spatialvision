@@ -11,7 +11,7 @@ import secrets
 import sqlite3
 from pathlib import Path
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Header, HTTPException
 from pydantic import BaseModel
 
 DB_PATH = Path(__file__).parent / "spatialvision.db"
@@ -57,6 +57,19 @@ def new_session(conn: sqlite3.Connection, user_id: int) -> str:
     token = secrets.token_urlsafe(32)
     conn.execute("INSERT INTO sessions (token, user_id) VALUES (?, ?)", (token, user_id))
     return token
+
+
+def user_from_token(authorization: str) -> sqlite3.Row:
+    """Finds the logged-in user from an 'Authorization: Bearer <token>' header."""
+    token = authorization.removeprefix("Bearer ").strip()
+    with db() as conn:
+        row = conn.execute(
+            "SELECT users.* FROM sessions JOIN users ON users.id = sessions.user_id WHERE sessions.token = ?",
+            (token,),
+        ).fetchone()
+    if row is None:
+        raise HTTPException(401, "Your session has ended. Please log in again.")
+    return row
 
 
 class SignupIn(BaseModel):
@@ -116,6 +129,20 @@ def login(body: LoginIn):
             raise HTTPException(401, "Wrong email or password.")
         token = new_session(conn, row["id"])
     return {"username": row["username"], "token": token}
+
+
+@router.get("/me")
+def me(authorization: str = Header("")):
+    row = user_from_token(authorization)
+    return {"username": row["username"], "email": row["email"]}
+
+
+@router.post("/logout")
+def logout(authorization: str = Header("")):
+    token = authorization.removeprefix("Bearer ").strip()
+    with db() as conn:
+        conn.execute("DELETE FROM sessions WHERE token = ?", (token,))
+    return {"ok": True}
 
 
 init_db()

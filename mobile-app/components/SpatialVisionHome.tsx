@@ -1,9 +1,16 @@
 import React, { useContext, useEffect, useMemo, useRef, useState } from 'react';
 import {
-  Animated, Easing, Platform, Pressable, ScrollView, StatusBar, StyleSheet, Switch, Text, TextInput, View, useWindowDimensions,
+  Animated, Easing, Platform, Pressable, ScrollView, StatusBar, StyleSheet, Text, TextInput, View, useColorScheme, useWindowDimensions,
 } from 'react-native';
 import { MaterialCommunityIcons as Icon } from '@expo/vector-icons';
+import AsyncStorage from '@react-native-async-storage/async-storage';
 import AuthScreens, { AuthUser } from './AuthScreens';
+
+// Keys for things the app remembers between launches.
+const KEY_SESSION = 'sv.session';
+const KEY_THEME = 'sv.themeMode'; // 'system', 'light' or 'dark'
+type ThemeMode = 'system' | 'light' | 'dark';
+const KEY_SERVER = 'sv.server';
 
 type Ic = React.ComponentProps<typeof Icon>['name'];
 type Route = 'home' | 'connect' | 'studio' | 'settings' | 'calibration' | 'tracking' | 'effects' | 'projects';
@@ -78,10 +85,10 @@ function makeStyles(T: Palette) {
     switchRow: { flexDirection: 'row', alignItems: 'center', gap: 12 },
     nav: { flexDirection: 'row', backgroundColor: T.s1, borderTopWidth: 1, borderColor: T.line, paddingTop: 8, paddingBottom: Platform.OS === 'android' ? 16 : 28 },
     navItem: { flex: 1, alignItems: 'center', gap: 2, minHeight: 52, justifyContent: 'center' },
-    splashName: { color: DARK.text, fontSize: 34, fontWeight: '800', letterSpacing: -0.8, marginTop: 14 },
-    splashSub: { color: DARK.cyan, fontSize: 15, fontWeight: '600', marginTop: 4 },
-    tag: { color: DARK.mute, fontSize: 12, marginTop: 8 },
-    placeholder: { position: 'absolute', bottom: 28, color: DARK.mute, fontSize: 10, opacity: 0.7 },
+    splashName: { color: T.text, fontSize: 34, fontWeight: '800', letterSpacing: -0.8, marginTop: 14 },
+    splashSub: { color: T.cyan, fontSize: 15, fontWeight: '600', marginTop: 4 },
+    tag: { color: T.mute, fontSize: 12, marginTop: 8 },
+    placeholder: { position: 'absolute', bottom: 28, color: T.mute, fontSize: 10, opacity: 0.7 },
   });
 }
 type Styles = ReturnType<typeof makeStyles>;
@@ -154,8 +161,8 @@ const Line = ({ a, b }: { a: number[]; b: number[] }) => {
   return <View style={{ position: 'absolute', left: (a[0] + b[0]) / 2 - len / 2, top: (a[1] + b[1]) / 2 - 1, width: len, height: 2, backgroundColor: DARK.cyan, transform: [{ rotate: `${Math.atan2(dy, dx)}rad` }] }} />;
 };
 
-const sDark = makeStyles(DARK);
 const Splash = ({ done }: { done: () => void }) => {
+  const { T, s } = useTheme();
   const art = useRef(new Animated.Value(0)).current;
   const br = useRef(new Animated.Value(0)).current;
   const out = useRef(new Animated.Value(1)).current;
@@ -168,22 +175,22 @@ const Splash = ({ done }: { done: () => void }) => {
     ]).start(() => done());
   }, []);
   return (
-    <Animated.View style={[StyleSheet.absoluteFill, { backgroundColor: DARK.bg, opacity: out, zIndex: 10, alignItems: 'center' }]}>
+    <Animated.View style={[StyleSheet.absoluteFill, { backgroundColor: T.bg, opacity: out, zIndex: 10, alignItems: 'center' }]}>
       <Animated.View style={{ opacity: art, marginTop: TOP + 70 }}>
-        <View style={{ position: 'absolute', top: 40, left: 20, right: 20, height: 280, borderRadius: 140, backgroundColor: DARK.violet, opacity: 0.18 }} />
+        <View style={{ position: 'absolute', top: 40, left: 20, right: 20, height: 280, borderRadius: 140, backgroundColor: T.violet, opacity: T.dark ? 0.18 : 0.1 }} />
         <Sculpture scale={1.15} />
       </Animated.View>
-      <View style={{ position: 'absolute', bottom: 0, left: 0, right: 0, height: 300, backgroundColor: 'rgba(8,11,22,0.6)' }} />
+      <View style={{ position: 'absolute', bottom: 0, left: 0, right: 0, height: 300, backgroundColor: T.dark ? 'rgba(8,11,22,0.6)' : 'rgba(244,246,252,0.6)' }} />
       <Animated.View style={{ position: 'absolute', bottom: 90, alignItems: 'center', opacity: br, transform: [{ scale: br.interpolate({ inputRange: [0, 1], outputRange: [0.92, 1] }) }] }}>
         <View style={{ width: 46, height: 46, alignItems: 'center', justifyContent: 'center' }}>
-          <View style={{ width: 32, height: 32, borderWidth: 2, borderColor: DARK.cyan, borderRadius: 6, transform: [{ rotate: '45deg' }] }} />
-          <View style={{ position: 'absolute', width: 13, height: 13, backgroundColor: DARK.blue, borderRadius: 3, transform: [{ rotate: '45deg' }] }} />
+          <View style={{ width: 32, height: 32, borderWidth: 2, borderColor: T.cyan, borderRadius: 6, transform: [{ rotate: '45deg' }] }} />
+          <View style={{ position: 'absolute', width: 13, height: 13, backgroundColor: T.blue, borderRadius: 3, transform: [{ rotate: '45deg' }] }} />
         </View>
-        <Text style={sDark.splashName}>SpatialVision</Text>
-        <Text style={sDark.splashSub}>Intelligent Projection Mapping</Text>
-        <Text style={sDark.tag}>Transform surfaces. Create experiences.</Text>
+        <Text style={s.splashName}>SpatialVision</Text>
+        <Text style={s.splashSub}>Intelligent Projection Mapping</Text>
+        <Text style={s.tag}>Transform surfaces. Create experiences.</Text>
       </Animated.View>
-      <Text style={sDark.placeholder}>Placeholder artwork</Text>
+      <Text style={s.placeholder}>Placeholder artwork</Text>
     </Animated.View>
   );
 };
@@ -192,13 +199,20 @@ const Splash = ({ done }: { done: () => void }) => {
 export default function SpatialVisionHome() {
   const { width } = useWindowDimensions();
   const colW = width < 360 ? '100%' : '48%';
-  const [isDark, setIsDark] = useState(true);
+  // Follows the phone's light/dark setting unless the user picks one in Settings.
+  const phone = useColorScheme();
+  const [themeMode, setThemeMode] = useState<ThemeMode>('system');
+  const isDark = themeMode === 'system' ? phone === 'dark' : themeMode === 'dark';
   const T = isDark ? DARK : LIGHT;
   const s = useMemo(() => makeStyles(T), [isDark]);
 
   const [splash, setSplash] = useState(true);
   const [user, setUser] = useState<AuthUser | null>(null);
-  const [route, setRoute] = useState<Route>('home');
+  const [loaded, setLoaded] = useState(false); // true once saved login and settings are read
+  const [savedServer, setSavedServer] = useState('');
+  const [route, setRouteRaw] = useState<Route>('home');
+  const [backTo, setBackTo] = useState<Route>('home');
+  const setRoute = (r: Route) => { setBackTo(route); setRouteRaw(r); };
   const [preset, setPreset] = useState(0);
   const [bright, setBright] = useState(70), [inten, setInten] = useState(60), [speed, setSpeed] = useState(50);
   const [playing, setPlaying] = useState(true);
@@ -231,6 +245,55 @@ export default function SpatialVisionHome() {
   }, [tracking]);
 
   useEffect(() => () => { ws.current?.close(); }, []);
+
+  // On launch: restore theme, last server address and the saved login.
+  useEffect(() => {
+    (async () => {
+      try {
+        const [theme, server, raw] = await Promise.all([
+          AsyncStorage.getItem(KEY_THEME), AsyncStorage.getItem(KEY_SERVER), AsyncStorage.getItem(KEY_SESSION),
+        ]);
+        if (theme === 'light' || theme === 'dark' || theme === 'system') setThemeMode(theme);
+        if (server) { setSavedServer(server); fillConnect(server); }
+        const saved: AuthUser | null = raw ? JSON.parse(raw) : null;
+        if (saved?.token && saved.server) {
+          // Ask the backend if the saved login is still valid. If the PC is off, keep the user signed in.
+          try {
+            const res = await fetch(`http://${saved.server}/auth/me`, { headers: { Authorization: `Bearer ${saved.token}` } });
+            if (res.status === 401) { await AsyncStorage.removeItem(KEY_SESSION); setLoaded(true); return; }
+          } catch {}
+        }
+        if (saved) setUser(saved);
+      } catch {}
+      setLoaded(true);
+    })();
+  }, []);
+
+  useEffect(() => { if (loaded) AsyncStorage.setItem(KEY_THEME, themeMode).catch(() => {}); }, [themeMode, loaded]);
+
+  // Pre-fills the Connect screen from an address like "192.168.10.13:8000".
+  const fillConnect = (server: string) => {
+    const [h, p] = server.split(':');
+    if (h && h !== 'localhost') setIp(h);
+    if (p) setPort(p);
+  };
+
+  const login = (u: AuthUser) => {
+    setUser(u);
+    setRouteRaw('home');
+    if (u.server) { setSavedServer(u.server); fillConnect(u.server); AsyncStorage.setItem(KEY_SERVER, u.server).catch(() => {}); }
+    AsyncStorage.setItem(KEY_SESSION, JSON.stringify(u)).catch(() => {});
+  };
+
+  const logout = async () => {
+    if (user?.token && user.server) {
+      fetch(`http://${user.server}/auth/logout`, { method: 'POST', headers: { Authorization: `Bearer ${user.token}` } }).catch(() => {});
+    }
+    disconnect();
+    await AsyncStorage.removeItem(KEY_SESSION).catch(() => {});
+    setUser(null);
+    setRouteRaw('home');
+  };
 
   const connect = () => {
     if (!/^(\d{1,3}\.){3}\d{1,3}$/.test(ip.trim())) { setConn('failed'); setErr('Enter a valid IPv4 address, e.g. 192.168.1.20'); return; }
@@ -265,7 +328,9 @@ export default function SpatialVisionHome() {
   const Head = ({ t, sub }: { t: string; sub: string }) => (
     <View style={{ marginBottom: 16 }}>
       {route !== 'connect' && route !== 'studio' && route !== 'settings' && route !== 'home' ? (
-        <Pressable onPress={() => setRoute('studio')} style={s.back} accessibilityLabel="Back"><Icon name="chevron-left" size={22} color={T.cyan} /><Text style={{ color: T.cyan }}>Studio</Text></Pressable>
+        <Pressable onPress={() => setRouteRaw(backTo === route ? 'home' : backTo)} style={s.back} accessibilityLabel="Back">
+          <Icon name="chevron-left" size={22} color={T.cyan} /><Text style={{ color: T.cyan }}>Back</Text>
+        </Pressable>
       ) : null}
       <Text style={s.h1}>{t}</Text><Text style={s.mute}>{sub}</Text>
     </View>
@@ -276,13 +341,14 @@ export default function SpatialVisionHome() {
     <ThemeCtx.Provider value={{ T, s }}>
       <View style={s.root}>
         <StatusBar barStyle={isDark ? 'light-content' : 'dark-content'} />
-        {!user && <AuthScreens T={T} onDone={setUser} />}
+        {loaded && !user && <AuthScreens T={T} onDone={login} initialServer={savedServer} />}
+        {user && (<>
         <ScrollView contentContainerStyle={s.scroll} showsVerticalScrollIndicator={false}>
           {route === 'home' && (<>
             <View style={s.topRow}>
               <View style={s.brand}><Logo /><Text style={s.brandT}>SpatialVision</Text></View>
               <View style={s.topIcons}>
-                <Pressable onPress={() => setIsDark(!isDark)} hitSlop={10} accessibilityRole="button" accessibilityLabel={isDark ? 'Switch to light mode' : 'Switch to dark mode'}>
+                <Pressable onPress={() => setThemeMode(isDark ? 'light' : 'dark')} hitSlop={10} accessibilityRole="button" accessibilityLabel={isDark ? 'Switch to light mode' : 'Switch to dark mode'}>
                   <Icon name={isDark ? 'white-balance-sunny' : 'weather-night'} size={24} color={T.mute} />
                 </Pressable>
                 <Pressable onPress={() => setRoute('settings')} hitSlop={10} accessibilityLabel="Settings"><Icon name="cog-outline" size={24} color={T.mute} /></Pressable>
@@ -449,12 +515,30 @@ export default function SpatialVisionHome() {
             <Head t="Settings" sub="App information and preferences." />
             <View style={s.card}>
               <View style={s.switchRow}>
+                <Icon name="account-circle-outline" size={28} color={T.cyan} />
+                <View style={{ flex: 1 }}>
+                  <Text style={s.ct}>{user?.demo ? 'Demo mode' : `@${user?.username}`}</Text>
+                  <Text style={s.mute}>{user?.demo ? 'No account. Nothing is saved on the server.' : `Signed in on ${user?.server ?? 'this device'}`}</Text>
+                </View>
+              </View>
+              <View style={{ marginTop: 14 }}>
+                <Btn label={user?.demo ? 'Exit demo mode' : 'Log out'} ghost icon="logout" onPress={logout} />
+              </View>
+            </View>
+            <View style={s.card}>
+              <View style={s.switchRow}>
                 <Icon name={isDark ? 'weather-night' : 'white-balance-sunny'} size={24} color={T.cyan} />
                 <View style={{ flex: 1 }}>
-                  <Text style={s.ct}>Dark mode</Text>
-                  <Text style={s.mute}>{isDark ? 'On' : 'Off, using the light theme'}</Text>
+                  <Text style={s.ct}>Appearance</Text>
+                  <Text style={s.mute}>{themeMode === 'system' ? `Following your phone (${isDark ? 'dark' : 'light'})` : isDark ? 'Dark' : 'Light'}</Text>
                 </View>
-                <Switch value={isDark} onValueChange={setIsDark} trackColor={{ false: '#C9D0E6', true: T.blue }} thumbColor="#FFFFFF" accessibilityLabel="Dark mode" />
+              </View>
+              <View style={[s.chips, { marginTop: 12 }]}>
+                {([['system', 'Phone setting'], ['light', 'Light'], ['dark', 'Dark']] as [ThemeMode, string][]).map(([m, l]) => (
+                  <Pressable key={m} onPress={() => setThemeMode(m)} accessibilityRole="button" accessibilityState={{ selected: themeMode === m }} accessibilityLabel={`Appearance: ${l}`}>
+                    <Text style={[s.chip, themeMode === m && s.chipOn]}>{l}</Text>
+                  </Pressable>
+                ))}
               </View>
             </View>
             <View style={s.card}>
@@ -476,8 +560,9 @@ export default function SpatialVisionHome() {
             </Pressable>
           ))}
         </View>
+        </>)}
         {splash && <Splash done={() => setSplash(false)} />}
       </View>
     </ThemeCtx.Provider>
   );
-}
+}
