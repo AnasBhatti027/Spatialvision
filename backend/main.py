@@ -92,6 +92,9 @@ async def tv_socket(ws: WebSocket):
     try:
         while True:
             data = await ws.receive_json()
+            if data.get("type") == "pointer_ack":
+                gestures.record_ack(float(data.get("t", 0)))
+                continue
             await hub.to_phones(data)
     except WebSocketDisconnect:
         pass

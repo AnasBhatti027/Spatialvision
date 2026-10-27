@@ -155,6 +155,7 @@ let eventTimer = null;
 const EVENT_TEXT = { swipe_right: 'SWIPE →', swipe_left: '← SWIPE', pinch: 'PINCH', open_palm: 'OPEN PALM', point: 'POINT', fist: 'FIST' };
 
 let hideTimer = null;
+let pointerCount = 0;
 function showPointer(m) {
   // Keep the dot for a moment when the hand is lost for a frame or two, so it does not blink.
   if (!m.visible) {
@@ -187,6 +188,10 @@ function connect() {
       scene = Object.assign(scene, m); render();
     } else if (m.type === 'pointer') {
       showPointer(m);
+      // Every 5th pointer: once it is drawn, send its time back so the backend can measure the delay.
+      if (m.visible && m.t !== undefined && ++pointerCount % 5 === 0) {
+        requestAnimationFrame(() => { if (ws.readyState === 1) ws.send(JSON.stringify({ type: 'pointer_ack', t: m.t })); });
+      }
     } else if (m.type === 'gesture') {
       showEvent(m.name);
     }

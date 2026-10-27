@@ -41,6 +41,8 @@ def open_camera(index: int = 0, width: int = WIDTH, height: int = HEIGHT, fps: i
     cap.set(cv2.CAP_PROP_FPS, fps)
     # Some drivers only accept the format after the size is set, so ask again.
     cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
+    # Keep only the newest frame waiting, so we never process an old picture (less delay).
+    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
     return cap
 
 

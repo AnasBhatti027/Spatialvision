@@ -34,7 +34,7 @@ CONNECTIONS = [(0, 1), (1, 2), (2, 3), (3, 4), (0, 5), (5, 6), (6, 7), (7, 8), (
                (9, 13), (13, 14), (14, 15), (15, 16), (13, 17), (17, 18), (18, 19), (19, 20), (0, 17)]
 
 PINCH_RATIO = 0.30      # thumb tip to index tip, relative to palm size
-HOLD_FRAMES = 5         # a gesture must be seen this many frames in a row before it counts
+HOLD_FRAMES = 3         # a gesture must be seen this many frames in a row before it counts (3 at 30 fps = 100 ms)
 SWIPE_WINDOW_S = 0.40   # a swipe must happen within this time
 SWIPE_DISTANCE = 0.30   # ...and move this far across the picture (fraction of its width)
 SWIPE_COOLDOWN_S = 0.8

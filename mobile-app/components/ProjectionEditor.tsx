@@ -6,7 +6,7 @@ import { ASPECT, Content, Pt, Quad, Scene, centroid, moveBy, rotateBy, scaleBy }
 
 type Theme = { dark: boolean; bg: string; s1: string; s2: string; blue: string; cyan: string; violet: string; text: string; mute: string; line: string; err: string };
 type Ic = React.ComponentProps<typeof Icon>['name'];
-export type VisionStatus = { running: boolean; fps: number | null; detect_ms: number | null; error: string | null };
+export type VisionStatus = { running: boolean; fps: number | null; detect_ms: number | null; latency_ms?: number | null; error: string | null };
 
 const GESTURE_NAMES: Record<string, string> = {
   pinch: 'Pinch', point: 'Point', open_palm: 'Open palm', fist: 'Fist', swipe_left: 'Swipe left', swipe_right: 'Swipe right',
@@ -250,7 +250,7 @@ export default function ProjectionEditor(p: Props) {
         </View>
         {p.vision.running ? (
           <Text style={[s.mute, { marginTop: 8 }]}>
-            {p.vision.fps == null ? 'Starting the camera…' : `Measured: ${p.vision.fps} fps, hand detection ${p.vision.detect_ms} ms per frame`}
+            {p.vision.fps == null ? 'Starting the camera…' : `Measured: ${p.vision.fps} fps, hand detection ${p.vision.detect_ms} ms per frame${p.vision.latency_ms != null ? `, delay to TV ${p.vision.latency_ms} ms` : ''}`}
           </Text>
         ) : (
           <Text style={[s.mute, { marginTop: 8 }]}>Uses the PC webcam. Stand in front of it and control the TV with your hand.</Text>

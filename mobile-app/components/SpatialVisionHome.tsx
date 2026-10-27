@@ -331,7 +331,7 @@ export default function SpatialVisionHome() {
   const proj = useProjectionScene(send, connected);
   onServerMessage.current = (m) => {
     if (m.type === 'scene') proj.applyRemote(m);
-    else if (m.type === 'vision_status') setVision({ running: !!m.running, fps: m.fps ?? null, detect_ms: m.detect_ms ?? null, error: m.error ?? null });
+    else if (m.type === 'vision_status') setVision({ running: !!m.running, fps: m.fps ?? null, detect_ms: m.detect_ms ?? null, latency_ms: m.latency_ms ?? null, error: m.error ?? null });
     else if (m.type === 'gesture') setLastGesture(m.name);
   };
   const P = PRESETS[preset];
