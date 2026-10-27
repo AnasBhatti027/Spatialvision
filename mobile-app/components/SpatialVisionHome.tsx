@@ -5,6 +5,8 @@ import {
 import { MaterialCommunityIcons as Icon } from '@expo/vector-icons';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import AuthScreens, { AuthUser } from './AuthScreens';
+import ProjectionEditor from './ProjectionEditor';
+import { useProjectionScene } from './projection';
 
 // Keys for things the app remembers between launches.
 const KEY_SESSION = 'sv.session';
@@ -156,10 +158,6 @@ const Stepper = ({ label, v, set }: { label: string; v: number; set: (n: number)
     </View>
   );
 };
-const Line = ({ a, b }: { a: number[]; b: number[] }) => {
-  const dx = b[0] - a[0], dy = b[1] - a[1], len = Math.hypot(dx, dy);
-  return <View style={{ position: 'absolute', left: (a[0] + b[0]) / 2 - len / 2, top: (a[1] + b[1]) / 2 - 1, width: len, height: 2, backgroundColor: DARK.cyan, transform: [{ rotate: `${Math.atan2(dy, dx)}rad` }] }} />;
-};
 
 const Splash = ({ done }: { done: () => void }) => {
   const { T, s } = useTheme();
@@ -221,8 +219,8 @@ export default function SpatialVisionHome() {
   const [ip, setIp] = useState(''), [port, setPort] = useState('8000'), [code, setCode] = useState('');
   const [conn, setConn] = useState<Conn>('idle'), [err, setErr] = useState('');
   const ws = useRef<WebSocket | null>(null);
-  const INIT = [[20, 20], [260, 20], [260, 160], [20, 160]];
-  const [pts, setPts] = useState(INIT), [sel, setSel] = useState(0), [calStat, setCalStat] = useState('Not calibrated');
+  const [tvConnected, setTvConnected] = useState(false);
+  const [dragging, setDragging] = useState(false);
   const [tracking, setTracking] = useState(false);
   const pulse = useRef(new Animated.Value(1)).current;
   const track = useRef(new Animated.Value(0)).current;
@@ -306,21 +304,25 @@ export default function SpatialVisionHome() {
     sock.onmessage = (e) => {
       try {
         const m = JSON.parse(e.data as string);
-        if (m.type === 'paired') { ok = true; clearTimeout(t); setConn('connected'); }
+        if (m.type === 'paired') { ok = true; clearTimeout(t); setConn('connected'); setTvConnected(!!m.tv_connected); }
+        else if (m.type === 'tv_status') setTvConnected(!!m.connected);
         else if (m.type === 'error') { clearTimeout(t); setConn('failed'); setErr(m.message); }
       } catch {}
     };
     sock.onerror = () => { clearTimeout(t); setConn('failed'); setErr('Could not reach the server.'); };
-    sock.onclose = () => { if (ok) setConn('idle'); };
+    sock.onclose = () => { setTvConnected(false); if (ok) setConn('idle'); };
   };
   const disconnect = () => { ws.current?.close(); ws.current = null; setConn('idle'); };
-  const nudge = (dx: number, dy: number) => {
-    setPts(pts.map((p, i) => (i === sel ? [Math.min(280, Math.max(0, p[0] + dx)), Math.min(180, Math.max(0, p[1] + dy))] : p)));
-    setCalStat('Adjusted, preview only');
+  // Sends a message to the TV through the backend. Returns false when not connected.
+  const send = (msg: object) => {
+    if (ws.current?.readyState !== WebSocket.OPEN) return false;
+    ws.current.send(JSON.stringify(msg));
+    return true;
   };
-  const resetAll = () => { setPreset(0); setBright(70); setInten(60); setSpeed(50); setProjects([]); setPts(INIT); setCalStat('Not calibrated'); };
+  const resetAll = () => { setPreset(0); setBright(70); setInten(60); setSpeed(50); setProjects([]); proj.resetAll(); };
 
   const connected = conn === 'connected';
+  const proj = useProjectionScene(send, connected);
   const P = PRESETS[preset];
   const level = (bright / 100) * (0.4 + inten / 160);
   const tab = (['home', 'connect', 'studio', 'settings'] as Route[]).includes(route) ? route : route === 'projects' ? 'home' : 'studio';
@@ -343,7 +345,7 @@ export default function SpatialVisionHome() {
         <StatusBar barStyle={isDark ? 'light-content' : 'dark-content'} />
         {loaded && !user && <AuthScreens T={T} onDone={login} initialServer={savedServer} />}
         {user && (<>
-        <ScrollView contentContainerStyle={s.scroll} showsVerticalScrollIndicator={false}>
+        <ScrollView contentContainerStyle={s.scroll} showsVerticalScrollIndicator={false} scrollEnabled={!dragging}>
           {route === 'home' && (<>
             <View style={s.topRow}>
               <View style={s.brand}><Logo /><Text style={s.brandT}>SpatialVision</Text></View>
@@ -378,7 +380,7 @@ export default function SpatialVisionHome() {
             <View style={s.grid}>
               {([
                 ['Projection Mapping', 'Preview and manage projection content.', 'Open Studio', 'cube-outline', 'studio'],
-                ['Spatial Calibration', 'Align content with physical surfaces.', 'Calibrate', 'vector-square', 'calibration'],
+                ['Projection Editor', 'Map an image onto a surface.', 'Open Editor', 'vector-square', 'calibration'],
                 ['Object Tracking', 'Access the tracking interface.', 'Start Tracking', 'crosshairs-gps', 'tracking'],
                 ['Effects and Presets', 'Colors, patterns and animation presets.', 'Explore', 'palette-swatch-outline', 'effects'],
                 ['Projects', 'Organize saved projects.', 'View Projects', 'folder-outline', 'projects'],
@@ -440,34 +442,16 @@ export default function SpatialVisionHome() {
               {PRESETS.map((p, i) => <Pressable key={p.n} onPress={() => setPreset(i)} accessibilityLabel={p.n}><Text style={[s.chip, i === preset && s.chipOn]}>{p.n}</Text></Pressable>)}
             </ScrollView>
             <View style={[s.chips, { marginTop: 14 }]}>
-              <Btn label="Calibrate" ghost icon="vector-square" onPress={() => setRoute('calibration')} />
+              <Btn label="Editor" ghost icon="vector-square" onPress={() => setRoute('calibration')} />
               <Btn label="Tracking" ghost icon="crosshairs-gps" onPress={() => setRoute('tracking')} />
             </View>
           </>)}
 
           {route === 'calibration' && (<>
-            <Head t="Calibration" sub="Pick a corner, then nudge it into place." />
-            <View style={[s.preview, { height: 180, width: 280, alignSelf: 'center' }]}>
-              {[0, 1, 2, 3].map((i) => <Line key={i} a={pts[i]} b={pts[(i + 1) % 4]} />)}
-              {pts.map((p, i) => (
-                <Pressable key={i} onPress={() => setSel(i)} accessibilityLabel={`Corner ${i + 1}`}
-                  style={{ position: 'absolute', left: p[0] - 12, top: p[1] - 12, width: 24, height: 24, borderRadius: 12, backgroundColor: i === sel ? DARK.cyan : DARK.violet, borderWidth: 2, borderColor: '#F4F6FF' }} />
-              ))}
-            </View>
-            <Text style={[s.badge, { position: 'relative', alignSelf: 'center', marginTop: 8, left: 0, bottom: 0 }]}>PREVIEW ONLY, NO HARDWARE CALIBRATION</Text>
-            <Text style={[s.status, { textAlign: 'center', marginTop: 10, marginLeft: 0 }]}>{calStat}</Text>
-            <View style={s.pad}>
-              <Pressable style={s.step} onPress={() => nudge(0, -8)} accessibilityLabel="Up"><Icon name="arrow-up" size={20} color={T.text} /></Pressable>
-              <View style={{ flexDirection: 'row', gap: 40 }}>
-                <Pressable style={s.step} onPress={() => nudge(-8, 0)} accessibilityLabel="Left"><Icon name="arrow-left" size={20} color={T.text} /></Pressable>
-                <Pressable style={s.step} onPress={() => nudge(8, 0)} accessibilityLabel="Right"><Icon name="arrow-right" size={20} color={T.text} /></Pressable>
-              </View>
-              <Pressable style={s.step} onPress={() => nudge(0, 8)} accessibilityLabel="Down"><Icon name="arrow-down" size={20} color={T.text} /></Pressable>
-            </View>
-            <View style={s.chips}>
-              <Btn label="Reset" ghost onPress={() => { setPts(INIT); setCalStat('Not calibrated'); }} />
-              <Btn label="Confirm" onPress={() => setCalStat('Saved in app, preview only')} />
-            </View>
+            <Head t="Projection Editor" sub="Drag the corners onto the surface. The TV updates live." />
+            <ProjectionEditor T={T} scene={proj.scene} update={proj.update} setCorners={proj.setCorners} reset={proj.reset}
+              connected={connected} tvConnected={tvConnected} server={`${ip.trim()}:${port}`} token={user?.token}
+              onGoConnect={() => setRoute('connect')} onDragging={setDragging} />
           </>)}
 
           {route === 'tracking' && (<>
