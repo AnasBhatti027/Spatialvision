@@ -3,6 +3,7 @@ import {
   Animated, Easing, Platform, Pressable, ScrollView, StatusBar, StyleSheet, Switch, Text, TextInput, View, useWindowDimensions,
 } from 'react-native';
 import { MaterialCommunityIcons as Icon } from '@expo/vector-icons';
+import AuthScreens, { AuthUser } from './AuthScreens';
 
 type Ic = React.ComponentProps<typeof Icon>['name'];
 type Route = 'home' | 'connect' | 'studio' | 'settings' | 'calibration' | 'tracking' | 'effects' | 'projects';
@@ -196,6 +197,7 @@ export default function SpatialVisionHome() {
   const s = useMemo(() => makeStyles(T), [isDark]);
 
   const [splash, setSplash] = useState(true);
+  const [user, setUser] = useState<AuthUser | null>(null);
   const [route, setRoute] = useState<Route>('home');
   const [preset, setPreset] = useState(0);
   const [bright, setBright] = useState(70), [inten, setInten] = useState(60), [speed, setSpeed] = useState(50);
@@ -274,6 +276,7 @@ export default function SpatialVisionHome() {
     <ThemeCtx.Provider value={{ T, s }}>
       <View style={s.root}>
         <StatusBar barStyle={isDark ? 'light-content' : 'dark-content'} />
+        {!user && <AuthScreens T={T} onDone={setUser} />}
         <ScrollView contentContainerStyle={s.scroll} showsVerticalScrollIndicator={false}>
           {route === 'home' && (<>
             <View style={s.topRow}>
