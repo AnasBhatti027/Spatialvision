@@ -1,0 +1,162 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>SpatialVision Display</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #000; overflow: hidden; font-family: system-ui, Segoe UI, Roboto, sans-serif; }
+  body.paired { cursor: none; }
+  /* The mapped content. It is screen-sized and then warped onto the four corners. */
+  #content { position: absolute; left: 0; top: 0; transform-origin: 0 0; overflow: hidden; background: #000; }
+  #content img { width: 100%; height: 100%; display: block; }
+  #content canvas { position: absolute; inset: 0; }
+  #overlay { position: fixed; inset: 0; display: flex; flex-direction: column; align-items: center; justify-content: center;
+    background: #080B16; color: #F4F6FF; text-align: center; padding: 24px; }
+  #overlay.hidden { display: none; }
+  .brand { color: #45D9F5; font-weight: 700; letter-spacing: 3px; font-size: 18px; }
+  #code { font-size: min(22vw, 220px); font-weight: 800; letter-spacing: 0.12em; margin: 8px 0; }
+  .mute { color: #A4ADC5; font-size: 22px; line-height: 1.5; }
+  .small { color: #586386; font-size: 15px; margin-top: 28px; }
+</style>
+</head>
+<body>
+<div id="content"></div>
+<div id="overlay">
+  <div class="brand">SPATIALVISION</div>
+  <div id="code">····</div>
+  <div class="mute" id="msg">Connecting to the backend…</div>
+  <div class="small">Double-click or press F11 for full screen.</div>
+</div>
+<script>
+// ---------- Perspective maths: map the screen rectangle onto 4 corner points ----------
+function adj(m) {
+  return [m[4]*m[8]-m[5]*m[7], m[2]*m[7]-m[1]*m[8], m[1]*m[5]-m[2]*m[4],
+          m[5]*m[6]-m[3]*m[8], m[0]*m[8]-m[2]*m[6], m[2]*m[3]-m[0]*m[5],
+          m[3]*m[7]-m[4]*m[6], m[1]*m[6]-m[0]*m[7], m[0]*m[4]-m[1]*m[3]];
+}
+function mulMM(a, b) {
+  const c = [];
+  for (let i = 0; i < 3; i++) for (let j = 0; j < 3; j++) {
+    let s = 0; for (let k = 0; k < 3; k++) s += a[3*i+k] * b[3*k+j]; c[3*i+j] = s;
+  }
+  return c;
+}
+function mulMV(m, v) {
+  return [m[0]*v[0]+m[1]*v[1]+m[2]*v[2], m[3]*v[0]+m[4]*v[1]+m[5]*v[2], m[6]*v[0]+m[7]*v[1]+m[8]*v[2]];
+}
+function basis(p) { // p = [[x,y] x4] in order TL, TR, BL, BR
+  const m = [p[0][0], p[1][0], p[2][0], p[0][1], p[1][1], p[2][1], 1, 1, 1];
+  const v = mulMV(adj(m), [p[3][0], p[3][1], 1]);
+  return mulMM(m, [v[0], 0, 0, 0, v[1], 0, 0, 0, v[2]]);
+}
+// Returns a CSS matrix3d() that maps a W x H box onto dst = [TL, TR, BR, BL] in pixels.
+function quadToCss(W, H, dst) {
+  const src = [[0, 0], [W, 0], [0, H], [W, H]];
+  const d = [dst[0], dst[1], dst[3], dst[2]];
+  const t = mulMM(basis(d), adj(basis(src)));
+  for (let i = 0; i < 9; i++) t[i] /= t[8];
+  return `matrix3d(${t[0]},${t[3]},0,${t[6]},${t[1]},${t[4]},0,${t[7]},0,0,1,0,${t[2]},${t[5]},0,${t[8]})`;
+}
+
+// ---------- Drawing ----------
+const content = document.getElementById('content');
+const overlay = document.getElementById('overlay');
+let scene = { type: 'scene', corners: [[0, 0], [1, 0], [1, 1], [0, 1]], content: 'pattern', fit: 'contain', grid: false, image_url: null };
+let shownKey = '';
+
+function drawPattern(cv, W, H, grid) {
+  cv.width = W; cv.height = H;
+  const g = cv.getContext('2d');
+  const cols = 16, rows = 9, cw = W / cols, ch = H / rows;
+  if (!grid) { // full test pattern: checkerboard, centre cross and numbered corners
+    for (let r = 0; r < rows; r++) for (let c = 0; c < cols; c++) {
+      g.fillStyle = (r + c) % 2 ? '#1B2550' : '#4D7CFE';
+      g.fillRect(c * cw, r * ch, cw + 1, ch + 1);
+    }
+  }
+  g.strokeStyle = grid ? 'rgba(69,217,245,0.8)' : 'rgba(255,255,255,0.35)';
+  g.lineWidth = 2;
+  for (let c = 1; c < cols; c++) { g.beginPath(); g.moveTo(c * cw, 0); g.lineTo(c * cw, H); g.stroke(); }
+  for (let r = 1; r < rows; r++) { g.beginPath(); g.moveTo(0, r * ch); g.lineTo(W, r * ch); g.stroke(); }
+  g.strokeStyle = '#45D9F5'; g.lineWidth = 8; g.strokeRect(4, 4, W - 8, H - 8);
+  if (grid) return;
+  g.strokeStyle = '#FFFFFF'; g.lineWidth = 4;
+  g.beginPath(); g.moveTo(W / 2 - 60, H / 2); g.lineTo(W / 2 + 60, H / 2); g.moveTo(W / 2, H / 2 - 60); g.lineTo(W / 2, H / 2 + 60); g.stroke();
+  g.fillStyle = '#FFFFFF'; g.font = `bold ${Math.round(H / 10)}px system-ui, sans-serif`;
+  g.textBaseline = 'top'; g.textAlign = 'left'; g.fillText('1', 24, 20);
+  g.textAlign = 'right'; g.fillText('2', W - 24, 20);
+  g.textBaseline = 'bottom'; g.fillText('3', W - 24, H - 20);
+  g.textAlign = 'left'; g.fillText('4', 24, H - 20);
+}
+
+function render() {
+  const W = window.innerWidth, H = window.innerHeight;
+  content.style.width = W + 'px';
+  content.style.height = H + 'px';
+  const px = scene.corners.map(([x, y]) => [x * W, y * H]);
+  content.style.transform = quadToCss(W, H, px);
+
+  // Only rebuild the inside when the content (not just the corners) changed.
+  const key = [scene.content, scene.image_url, scene.fit, scene.grid, W, H].join('|');
+  if (key === shownKey) return;
+  shownKey = key;
+  content.innerHTML = '';
+  if (scene.content === 'image' && scene.image_url) {
+    const img = document.createElement('img');
+    img.src = scene.image_url;
+    img.style.objectFit = scene.fit === 'cover' ? 'cover' : 'contain';
+    content.appendChild(img);
+  } else if (scene.content === 'pattern') {
+    const cv = document.createElement('canvas');
+    drawPattern(cv, W, H, false);
+    content.appendChild(cv);
+  }
+  if (scene.grid) {
+    const cv = document.createElement('canvas');
+    drawPattern(cv, W, H, true);
+    content.appendChild(cv);
+  }
+}
+window.addEventListener('resize', render);
+render();
+
+// ---------- Full screen on double-click ----------
+document.addEventListener('dblclick', () => {
+  if (document.fullscreenElement) document.exitFullscreen(); else document.documentElement.requestFullscreen().catch(() => {});
+});
+
+// ---------- Connection to the backend ----------
+const codeEl = document.getElementById('code');
+const msgEl = document.getElementById('msg');
+let phones = 0;
+
+function showOverlay() {
+  overlay.classList.toggle('hidden', phones > 0);
+  document.body.classList.toggle('paired', phones > 0);
+}
+
+function connect() {
+  const ws = new WebSocket(`ws://${location.host}/ws/tv`);
+  ws.onmessage = (e) => {
+    let m; try { m = JSON.parse(e.data); } catch { return; }
+    if (m.type === 'pair_code') {
+      codeEl.textContent = m.code;
+      msgEl.innerHTML = `On your phone open SpatialVision → <b>Connect</b>.<br>PC address <b>${location.hostname}</b>, port <b>${location.port || 80}</b>, then enter this code.`;
+    } else if (m.type === 'phones') {
+      phones = m.count; showOverlay();
+    } else if (m.type === 'scene') {
+      scene = Object.assign(scene, m); render();
+    }
+  };
+  ws.onclose = () => {
+    phones = 0; showOverlay();
+    codeEl.textContent = '····';
+    msgEl.textContent = 'Lost connection to the backend. Retrying…';
+    setTimeout(connect, 2000);
+  };
+}
+connect();
+</script>
+</body>
+</html>

@@ -9,6 +9,7 @@ __pycache__/
 *.pyc
 .env
 *.db
+backend/assets/
 
 # Android
 build/
