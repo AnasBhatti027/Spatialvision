@@ -6,6 +6,11 @@ import { ASPECT, Content, Pt, Quad, Scene, centroid, moveBy, rotateBy, scaleBy }
 
 type Theme = { dark: boolean; bg: string; s1: string; s2: string; blue: string; cyan: string; violet: string; text: string; mute: string; line: string; err: string };
 type Ic = React.ComponentProps<typeof Icon>['name'];
+export type VisionStatus = { running: boolean; fps: number | null; detect_ms: number | null; error: string | null };
+
+const GESTURE_NAMES: Record<string, string> = {
+  pinch: 'Pinch', point: 'Point', open_palm: 'Open palm', fist: 'Fist', swipe_left: 'Swipe left', swipe_right: 'Swipe right',
+};
 
 const CANVAS_BG = '#0B1022';
 const CYAN = '#45D9F5', VIOLET = '#9065FF', WHITE = '#F4F6FF';
@@ -23,6 +28,9 @@ type Props = {
   token?: string;         // login token, needed to upload images
   onGoConnect: () => void;
   onDragging: (dragging: boolean) => void; // lets the screen stop scrolling while a handle is dragged
+  vision: VisionStatus;        // hand tracking status measured by the backend
+  lastGesture: string;
+  onGestures: (on: boolean) => void;
 };
 
 /** A draggable handle. Drag reports the distance moved since the finger went down, in pixels. */
@@ -233,6 +241,37 @@ export default function ProjectionEditor(p: Props) {
         {scene.content === 'image' && scene.imageUrl && !busy ? <Text style={[s.hint, { color: T.cyan }]}>Image is on the PC and shown on the TV.</Text> : null}
         {msg ? <Text style={s.error}>{msg}</Text> : null}
       </View>
+
+      {/* Touch-free control with hand gestures (webcam on the PC) */}
+      <View style={s.card}>
+        <View style={[s.row, { justifyContent: 'space-between' }]}>
+          <Text style={s.ct}>Gesture control</Text>
+          <Pill ok={p.vision.running} label={p.vision.running ? 'Camera on' : 'Off'} />
+        </View>
+        {p.vision.running ? (
+          <Text style={[s.mute, { marginTop: 8 }]}>
+            {p.vision.fps == null ? 'Starting the camera…' : `Measured: ${p.vision.fps} fps, hand detection ${p.vision.detect_ms} ms per frame`}
+          </Text>
+        ) : (
+          <Text style={[s.mute, { marginTop: 8 }]}>Uses the PC webcam. Stand in front of it and control the TV with your hand.</Text>
+        )}
+        {p.vision.running && (
+          <Text style={[s.ct, { marginTop: 10, color: T.cyan }]}>{p.lastGesture ? `Last gesture: ${GESTURE_NAMES[p.lastGesture] ?? p.lastGesture}` : 'No gesture yet'}</Text>
+        )}
+        <View style={{ marginTop: 10, gap: 4 }}>
+          <Text style={s.hint}>☝️  Index finger moves the pointer on the TV</Text>
+          <Text style={s.hint}>🤏  Pinch and move drags the whole shape</Text>
+          <Text style={s.hint}>🖐️  Swipe an open hand left or right to change the content</Text>
+        </View>
+        <Pressable style={[s.btn, { marginTop: 12 }, p.vision.running && s.ghostSolo, !p.connected && { opacity: 0.45 }]}
+          disabled={!p.connected} onPress={() => p.onGestures(!p.vision.running)} accessibilityRole="button"
+          accessibilityLabel={p.vision.running ? 'Stop gesture control' : 'Start gesture control'}>
+          <Icon name={p.vision.running ? 'stop' : 'hand-wave-outline'} size={18} color={p.vision.running ? T.blue : '#FFFFFF'} />
+          <Text style={[s.btnT, p.vision.running && { color: T.blue }]}>{p.vision.running ? 'Stop gestures' : 'Start gestures'}</Text>
+        </Pressable>
+        {!p.connected && <Text style={s.hint}>Pair with the PC first.</Text>}
+        {p.vision.error ? <Text style={s.error}>{p.vision.error}</Text> : null}
+      </View>
     </View>
   );
 }
@@ -262,6 +301,7 @@ function makeStyles(T: Theme) {
     toolT: { color: T.mute, fontSize: 11 },
     btn: { minHeight: 46, borderRadius: 23, backgroundColor: T.blue, flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 8, paddingHorizontal: 18 },
     ghost: { backgroundColor: 'transparent', borderWidth: 1.5, borderColor: T.blue, flex: 1 },
+    ghostSolo: { backgroundColor: 'transparent', borderWidth: 1.5, borderColor: T.blue },
     btnT: { color: '#FFFFFF', fontSize: 15, fontWeight: '700' },
   });
 }

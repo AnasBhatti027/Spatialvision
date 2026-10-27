@@ -18,10 +18,22 @@
   #code { font-size: min(22vw, 220px); font-weight: 800; letter-spacing: 0.12em; margin: 8px 0; }
   .mute { color: #A4ADC5; font-size: 22px; line-height: 1.5; }
   .small { color: #586386; font-size: 15px; margin-top: 28px; }
+  /* Hand pointer: follows the index fingertip seen by the webcam. */
+  #pointer { position: fixed; left: 0; top: 0; width: 34px; height: 34px; margin: -17px 0 0 -17px; border-radius: 50%;
+    border: 4px solid #45D9F5; background: rgba(69,217,245,0.25); pointer-events: none; display: none;
+    transition: width .12s, height .12s, margin .12s, background .12s; z-index: 5; }
+  #pointer.pinch { width: 20px; height: 20px; margin: -10px 0 0 -10px; background: #45D9F5; border-color: #FFFFFF; }
+  #pointer.open_palm { border-color: #9065FF; background: rgba(144,101,255,0.25); }
+  #event { position: fixed; left: 50%; bottom: 28px; transform: translateX(-50%); padding: 8px 18px; border-radius: 20px;
+    background: rgba(8,11,22,0.75); color: #45D9F5; font-size: 22px; font-weight: 700; letter-spacing: 1px;
+    opacity: 0; transition: opacity .3s; pointer-events: none; z-index: 5; }
+  #event.show { opacity: 1; }
 </style>
 </head>
 <body>
 <div id="content"></div>
+<div id="pointer"></div>
+<div id="event"></div>
 <div id="overlay">
   <div class="brand">SPATIALVISION</div>
   <div id="code">····</div>
@@ -136,6 +148,32 @@ function showOverlay() {
   document.body.classList.toggle('paired', phones > 0);
 }
 
+// ---------- Hand pointer and gesture labels ----------
+const pointerEl = document.getElementById('pointer');
+const eventEl = document.getElementById('event');
+let eventTimer = null;
+const EVENT_TEXT = { swipe_right: 'SWIPE →', swipe_left: '← SWIPE', pinch: 'PINCH', open_palm: 'OPEN PALM', point: 'POINT', fist: 'FIST' };
+
+let hideTimer = null;
+function showPointer(m) {
+  // Keep the dot for a moment when the hand is lost for a frame or two, so it does not blink.
+  if (!m.visible) {
+    if (!hideTimer) hideTimer = setTimeout(() => { pointerEl.style.display = 'none'; hideTimer = null; }, 300);
+    return;
+  }
+  clearTimeout(hideTimer); hideTimer = null;
+  pointerEl.style.display = 'block';
+  pointerEl.style.left = (m.x * window.innerWidth) + 'px';
+  pointerEl.style.top = (m.y * window.innerHeight) + 'px';
+  pointerEl.className = m.gesture === 'pinch' || m.gesture === 'open_palm' ? m.gesture : '';
+}
+function showEvent(name) {
+  eventEl.textContent = EVENT_TEXT[name] || name;
+  eventEl.classList.add('show');
+  clearTimeout(eventTimer);
+  eventTimer = setTimeout(() => eventEl.classList.remove('show'), 900);
+}
+
 function connect() {
   const ws = new WebSocket(`ws://${location.host}/ws/tv`);
   ws.onmessage = (e) => {
@@ -147,6 +185,10 @@ function connect() {
       phones = m.count; showOverlay();
     } else if (m.type === 'scene') {
       scene = Object.assign(scene, m); render();
+    } else if (m.type === 'pointer') {
+      showPointer(m);
+    } else if (m.type === 'gesture') {
+      showEvent(m.name);
     }
   };
   ws.onclose = () => {

@@ -56,6 +56,13 @@ export function rotateBy(q: Quad, degrees: number): Quad {
   return next.every(([x, y]) => x >= 0 && x <= 1 && y >= 0 && y <= 1) ? next : q;
 }
 
+/** The message the TV understands for a scene. */
+function sceneMessage(sc: Scene) {
+  // An image that has not finished uploading cannot be shown on the TV yet.
+  const content = sc.content === 'image' && !sc.imageUrl ? 'blank' : sc.content;
+  return { type: 'scene', corners: sc.corners, content, fit: sc.fit, grid: sc.grid, image_url: sc.imageUrl };
+}
+
 /**
  * Holds the projection scene and sends it to the TV (through the backend) whenever it changes.
  * Sends at most every 40 ms, always with the newest state, so dragging stays smooth.
@@ -64,12 +71,13 @@ export function useProjectionScene(send: (msg: object) => boolean, connected: bo
   const [scene, setScene] = useState<Scene>(DEFAULT_SCENE);
   const latest = useRef<object | null>(null);
   const timer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const fromBackend = useRef(''); // the last scene the backend sent us, so we do not echo it back
 
   useEffect(() => {
     if (!connected) return;
-    // An image that has not finished uploading cannot be shown on the TV yet.
-    const content = scene.content === 'image' && !scene.imageUrl ? 'blank' : scene.content;
-    latest.current = { type: 'scene', corners: scene.corners, content, fit: scene.fit, grid: scene.grid, image_url: scene.imageUrl };
+    const msg = sceneMessage(scene);
+    if (JSON.stringify(msg) === fromBackend.current) return;
+    latest.current = msg;
     if (timer.current) return;
     timer.current = setTimeout(() => {
       timer.current = null;
@@ -83,5 +91,18 @@ export function useProjectionScene(send: (msg: object) => boolean, connected: bo
   const setCorners = (corners: Quad) => update({ corners });
   const reset = () => update({ corners: DEFAULT_QUAD });
   const resetAll = () => setScene(DEFAULT_SCENE);
-  return { scene, update, setCorners, reset, resetAll };
+
+  /** Applies a scene changed on the backend (for example by a pinch-drag gesture). */
+  const applyRemote = (m: { corners?: Quad; content?: Content; fit?: Fit; grid?: boolean; image_url?: string | null }) => {
+    setScene((s) => {
+      const imageUrl = m.image_url !== undefined ? m.image_url : s.imageUrl;
+      const next: Scene = {
+        corners: m.corners ?? s.corners, content: m.content ?? s.content, fit: m.fit ?? s.fit, grid: m.grid ?? s.grid,
+        imageUrl, localUri: imageUrl === s.imageUrl ? s.localUri : null,
+      };
+      fromBackend.current = JSON.stringify(sceneMessage(next));
+      return next;
+    });
+  };
+  return { scene, update, setCorners, reset, resetAll, applyRemote };
 }

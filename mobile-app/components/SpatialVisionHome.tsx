@@ -7,6 +7,7 @@ import AsyncStorage from '@react-native-async-storage/async-storage';
 import AuthScreens, { AuthUser } from './AuthScreens';
 import ProjectionEditor from './ProjectionEditor';
 import { useProjectionScene } from './projection';
+import type { VisionStatus } from './ProjectionEditor';
 
 // Keys for things the app remembers between launches.
 const KEY_SESSION = 'sv.session';
@@ -220,6 +221,10 @@ export default function SpatialVisionHome() {
   const [conn, setConn] = useState<Conn>('idle'), [err, setErr] = useState('');
   const ws = useRef<WebSocket | null>(null);
   const [tvConnected, setTvConnected] = useState(false);
+  const [vision, setVision] = useState<VisionStatus>({ running: false, fps: null, detect_ms: null, error: null });
+  const [lastGesture, setLastGesture] = useState('');
+  // Handles messages from the backend after pairing. Kept in a ref so it always sees the newest state.
+  const onServerMessage = useRef<(m: any) => void>(() => {});
   const [dragging, setDragging] = useState(false);
   const [tracking, setTracking] = useState(false);
   const pulse = useRef(new Animated.Value(1)).current;
@@ -307,10 +312,11 @@ export default function SpatialVisionHome() {
         if (m.type === 'paired') { ok = true; clearTimeout(t); setConn('connected'); setTvConnected(!!m.tv_connected); }
         else if (m.type === 'tv_status') setTvConnected(!!m.connected);
         else if (m.type === 'error') { clearTimeout(t); setConn('failed'); setErr(m.message); }
+        else onServerMessage.current(m);
       } catch {}
     };
     sock.onerror = () => { clearTimeout(t); setConn('failed'); setErr('Could not reach the server.'); };
-    sock.onclose = () => { setTvConnected(false); if (ok) setConn('idle'); };
+    sock.onclose = () => { setTvConnected(false); setVision({ running: false, fps: null, detect_ms: null, error: null }); if (ok) setConn('idle'); };
   };
   const disconnect = () => { ws.current?.close(); ws.current = null; setConn('idle'); };
   // Sends a message to the TV through the backend. Returns false when not connected.
@@ -323,6 +329,11 @@ export default function SpatialVisionHome() {
 
   const connected = conn === 'connected';
   const proj = useProjectionScene(send, connected);
+  onServerMessage.current = (m) => {
+    if (m.type === 'scene') proj.applyRemote(m);
+    else if (m.type === 'vision_status') setVision({ running: !!m.running, fps: m.fps ?? null, detect_ms: m.detect_ms ?? null, error: m.error ?? null });
+    else if (m.type === 'gesture') setLastGesture(m.name);
+  };
   const P = PRESETS[preset];
   const level = (bright / 100) * (0.4 + inten / 160);
   const tab = (['home', 'connect', 'studio', 'settings'] as Route[]).includes(route) ? route : route === 'projects' ? 'home' : 'studio';
@@ -451,7 +462,8 @@ export default function SpatialVisionHome() {
             <Head t="Projection Editor" sub="Drag the corners onto the surface. The TV updates live." />
             <ProjectionEditor T={T} scene={proj.scene} update={proj.update} setCorners={proj.setCorners} reset={proj.reset}
               connected={connected} tvConnected={tvConnected} server={`${ip.trim()}:${port}`} token={user?.token}
-              onGoConnect={() => setRoute('connect')} onDragging={setDragging} />
+              onGoConnect={() => setRoute('connect')} onDragging={setDragging}
+              vision={vision} lastGesture={lastGesture} onGestures={(on) => send({ type: on ? 'start_gestures' : 'stop_gestures' })} />
           </>)}
 
           {route === 'tracking' && (<>

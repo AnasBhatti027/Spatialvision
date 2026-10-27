@@ -36,7 +36,7 @@ CONNECTIONS = [(0, 1), (1, 2), (2, 3), (3, 4), (0, 5), (5, 6), (6, 7), (7, 8), (
 PINCH_RATIO = 0.30      # thumb tip to index tip, relative to palm size
 HOLD_FRAMES = 5         # a gesture must be seen this many frames in a row before it counts
 SWIPE_WINDOW_S = 0.40   # a swipe must happen within this time
-SWIPE_DISTANCE = 0.25   # ...and move this far across the picture (fraction of its width)
+SWIPE_DISTANCE = 0.30   # ...and move this far across the picture (fraction of its width)
 SWIPE_COOLDOWN_S = 0.8
 
 
@@ -76,7 +76,8 @@ class GestureTracker:
         self.counts = Counter()       # how often each gesture started, for analytics
 
     def update(self, raw: str, tip_x: float | None, now: float) -> str | None:
-        """Feeds one frame. Returns an event name when something new happens, else None."""
+        """Feeds one frame. Returns an event name when something new happens, else None.
+        A swipe only counts with an open hand, so pointing or pinching never triggers one."""
         event = None
         self.recent.append(raw)
         if len(self.recent) == HOLD_FRAMES and len(set(self.recent)) == 1 and raw != self.stable:
@@ -85,7 +86,7 @@ class GestureTracker:
                 self.counts[raw] += 1
                 event = raw
 
-        if tip_x is None:
+        if tip_x is None or raw != "open_palm":
             self.trail.clear()
         else:
             self.trail.append((now, tip_x))

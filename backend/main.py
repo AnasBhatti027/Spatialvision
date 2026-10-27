@@ -1,3 +1,4 @@
+import asyncio
 import base64
 import binascii
 import secrets
@@ -9,6 +10,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from auth import router as auth_router, user_from_token
+from vision.gesture_service import GestureService
 
 BASE = Path(__file__).parent
 TV_DIR = BASE.parent / "tv-display"   # the TV web page
@@ -35,8 +37,10 @@ class Hub:
         self.code = new_code()
         self.tv: WebSocket | None = None
         self.phones: set[WebSocket] = set()
-        # The last scene the phone sent (corners, content). A TV that reconnects gets it straight away.
-        self.scene: dict | None = None
+        # The current scene (corners, content). Changed by the phone or by gestures.
+        # A TV that reconnects gets it straight away.
+        self.scene: dict = {"type": "scene", "corners": [[0.1, 0.1], [0.9, 0.1], [0.9, 0.9], [0.1, 0.9]],
+                            "content": "pattern", "fit": "contain", "grid": False, "image_url": None}
 
     async def to_phones(self, message: dict):
         for ws in list(self.phones):
@@ -55,8 +59,20 @@ class Hub:
     async def phones_changed(self):
         await self.to_tv({"type": "phones", "count": len(self.phones)})
 
+    async def update_scene(self, changes: dict):
+        """Used by gestures: changes part of the scene and tells the TV and the phones."""
+        self.scene = {**self.scene, **changes}
+        await self.to_tv(self.scene)
+        await self.to_phones(self.scene)
+
 
 hub = Hub()
+gestures = GestureService(hub)
+
+
+@app.on_event("shutdown")
+def stop_gestures():
+    gestures.stop()
 
 
 @app.get("/health")
@@ -71,8 +87,7 @@ async def tv_socket(ws: WebSocket):
     hub.code = new_code()
     await ws.send_json({"type": "pair_code", "code": hub.code})
     await ws.send_json({"type": "phones", "count": len(hub.phones)})
-    if hub.scene:
-        await ws.send_json(hub.scene)
+    await ws.send_json(hub.scene)
     await hub.to_phones({"type": "tv_status", "connected": True})
     try:
         while True:
@@ -95,12 +110,20 @@ async def phone_socket(ws: WebSocket, code: str = ""):
         return
     hub.phones.add(ws)
     await ws.send_json({"type": "paired", "tv_connected": hub.tv is not None})
+    await ws.send_json(gestures.status)
     await hub.phones_changed()
     try:
         while True:
             data = await ws.receive_json()
-            if data.get("type") == "scene":
-                hub.scene = data
+            kind = data.get("type")
+            if kind == "start_gestures":
+                gestures.start(asyncio.get_running_loop())
+                continue
+            if kind == "stop_gestures":
+                gestures.stop()
+                continue
+            if kind == "scene":
+                hub.scene = {**hub.scene, **data}
             await hub.to_tv(data)
     except WebSocketDisconnect:
         pass
