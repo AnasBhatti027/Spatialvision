@@ -1,3 +1,4 @@
+import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import React, { useContext, useEffect, useMemo, useRef, useState } from 'react';
 import {
   Animated, Easing, Platform, Pressable, ScrollView, StatusBar, StyleSheet, Text, TextInput, View, useColorScheme, useWindowDimensions,
@@ -196,6 +197,7 @@ const Splash = ({ done }: { done: () => void }) => {
 
 /* ---------- App ---------- */
 export default function SpatialVisionHome() {
+  const insets = useSafeAreaInsets();
   const { width } = useWindowDimensions();
   const colW = width < 360 ? '100%' : '48%';
   // Follows the phone's light/dark setting unless the user picks one in Settings.
@@ -548,7 +550,7 @@ export default function SpatialVisionHome() {
           </>)}
         </ScrollView>
 
-        <View style={s.nav}>
+        <View style={[s.nav, { paddingBottom: 8 + insets.bottom }]}>
           {NAV.map(([r, l, ic]) => (
             <Pressable key={r} style={s.navItem} onPress={() => setRoute(r)} accessibilityRole="button" accessibilityState={{ selected: tab === r }} accessibilityLabel={l}>
               <Icon name={ic} size={24} color={tab === r ? T.blue : T.mute} />
@@ -561,4 +563,4 @@ export default function SpatialVisionHome() {
       </View>
     </ThemeCtx.Provider>
   );
-}
+}
