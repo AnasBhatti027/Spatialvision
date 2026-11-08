@@ -14,6 +14,7 @@ Press Q or Esc in the preview window to stop.
 """
 import argparse
 import sys
+import threading
 import time
 
 import cv2
@@ -44,6 +45,53 @@ def open_camera(index: int = 0, width: int = WIDTH, height: int = HEIGHT, fps: i
     # Keep only the newest frame waiting, so we never process an old picture (less delay).
     cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
     return cap
+
+
+class LatestFrameReader:
+    """Reads the camera in its own thread and keeps only the newest picture.
+
+    Without this, when hand detection takes longer than one camera frame, pictures wait in the
+    driver's queue and the pointer shows where the hand WAS (growing delay). With it, slow frames
+    are skipped instead, so every processed picture is the newest one."""
+
+    def __init__(self, cap):
+        self.cap = cap
+        self.cond = threading.Condition()
+        self.frame, self.at, self.count, self.ok = None, 0.0, 0, True
+        self.dropped = 0          # pictures replaced before anyone used them (for the status line)
+        self._used = 0
+        self._stop = False
+        self.thread = threading.Thread(target=self._loop, name="camera-reader", daemon=True)
+        self.thread.start()
+
+    def _loop(self):
+        while not self._stop:
+            ok, frame = self.cap.read()
+            at = time.perf_counter()
+            with self.cond:
+                if not ok:
+                    self.ok = False
+                    self.cond.notify_all()
+                    return
+                if self.count > self._used:
+                    self.dropped += 1
+                self.frame, self.at, self.count = frame, at, self.count + 1
+                self.cond.notify_all()
+
+    def read(self, timeout: float = 2.0):
+        """Waits for a picture newer than the last one returned. Returns (ok, frame, time it arrived)."""
+        with self.cond:
+            if not self.cond.wait_for(lambda: self.count > self._used or not self.ok, timeout):
+                return False, None, 0.0
+            if self.count <= self._used:
+                return False, None, 0.0
+            self._used = self.count
+            return True, self.frame, self.at
+
+    def release(self):
+        self._stop = True
+        self.thread.join(timeout=1.0)
+        self.cap.release()
 
 
 def fourcc_name(cap) -> str:

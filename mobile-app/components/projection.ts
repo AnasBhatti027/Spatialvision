@@ -56,6 +56,32 @@ export function rotateBy(q: Quad, degrees: number): Quad {
   return next.every(([x, y]) => x >= 0 && x <= 1 && y >= 0 && y <= 1) ? next : q;
 }
 
+/**
+ * Perspective map from the unit square to the quad (the same maths the TV warp uses).
+ * (u, v) = (0,0) top-left, (1,0) top-right, (1,1) bottom-right, (0,1) bottom-left.
+ * Returns null when the shape is folded over itself, because no flat picture fits it.
+ */
+export function squareToQuad(q: Quad): ((u: number, v: number) => Pt) | null {
+  const [[x0, y0], [x1, y1], [x2, y2], [x3, y3]] = q;
+  const dx1 = x1 - x2, dx2 = x3 - x2, dx3 = x0 - x1 + x2 - x3;
+  const dy1 = y1 - y2, dy2 = y3 - y2, dy3 = y0 - y1 + y2 - y3;
+  let g = 0, h = 0;
+  if (Math.abs(dx3) > 1e-9 || Math.abs(dy3) > 1e-9) {
+    const det = dx1 * dy2 - dx2 * dy1;
+    if (Math.abs(det) < 1e-9) return null;
+    g = (dx3 * dy2 - dx2 * dy3) / det;
+    h = (dx1 * dy3 - dx3 * dy1) / det;
+  }
+  const a = x1 - x0 + g * x1, b = x3 - x0 + h * x3, c = x0;
+  const d = y1 - y0 + g * y1, e = y3 - y0 + h * y3, f = y0;
+  // A corner with w <= 0 means the shape is folded; refuse rather than draw garbage.
+  if ([[0, 0], [1, 0], [1, 1], [0, 1]].some(([u, v]) => g * u + h * v + 1 <= 1e-6)) return null;
+  return (u, v) => {
+    const w = g * u + h * v + 1;
+    return [(a * u + b * v + c) / w, (d * u + e * v + f) / w];
+  };
+}
+
 /** The message the TV understands for a scene. */
 function sceneMessage(sc: Scene) {
   // An image that has not finished uploading cannot be shown on the TV yet.
@@ -65,27 +91,40 @@ function sceneMessage(sc: Scene) {
 
 /**
  * Holds the projection scene and sends it to the TV (through the backend) whenever it changes.
- * Sends at most every 40 ms, always with the newest state, so dragging stays smooth.
+ * Sends at most every 33 ms, always with the newest state.
+ * While a finger drags a corner, the editor calls sendLive() instead of changing the scene,
+ * so the TV follows the finger without re-drawing the whole phone screen on every move.
  */
 export function useProjectionScene(send: (msg: object) => boolean, connected: boolean) {
   const [scene, setScene] = useState<Scene>(DEFAULT_SCENE);
+  const sceneRef = useRef(scene);
+  sceneRef.current = scene;
   const latest = useRef<object | null>(null);
   const timer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const fromBackend = useRef(''); // the last scene the backend sent us, so we do not echo it back
 
-  useEffect(() => {
-    if (!connected) return;
-    const msg = sceneMessage(scene);
-    if (JSON.stringify(msg) === fromBackend.current) return;
+  const push = (msg: object) => {
     latest.current = msg;
     if (timer.current) return;
     timer.current = setTimeout(() => {
       timer.current = null;
       if (latest.current) send(latest.current);
-    }, 40);
+    }, 33);
+  };
+
+  useEffect(() => {
+    if (!connected) return;
+    const msg = sceneMessage(scene);
+    if (JSON.stringify(msg) === fromBackend.current) return;
+    push(msg);
   }, [scene, connected]);
 
   useEffect(() => () => { if (timer.current) clearTimeout(timer.current); }, []);
+
+  /** Sends corners to the TV during a drag without storing them. Call setCorners when the finger lifts. */
+  const sendLive = (corners: Quad) => {
+    if (connected) push(sceneMessage({ ...sceneRef.current, corners }));
+  };
 
   const update = (part: Partial<Scene>) => setScene((s) => ({ ...s, ...part }));
   const setCorners = (corners: Quad) => update({ corners });
@@ -104,5 +143,5 @@ export function useProjectionScene(send: (msg: object) => boolean, connected: bo
       return next;
     });
   };
-  return { scene, update, setCorners, reset, resetAll, applyRemote };
+  return { scene, update, setCorners, sendLive, reset, resetAll, applyRemote };
 }

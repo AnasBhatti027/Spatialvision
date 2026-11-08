@@ -1,0 +1,380 @@
+"""Turns raw hand points into a steady pointer on the TV, and lets a pinch edit the projection shape.
+
+No camera or MediaPipe code here, so every part can be tested with made-up numbers
+(see test_interaction.py in the backend folder).
+
+Root causes of the pointer problems (found 9 Nov 2026) and what this file does about them
+1. The pointer followed the index FINGERTIP. MediaPipe's fingertip points are its noisiest, they move
+   whenever the fingers bend or pinch, and near the top of the picture the fingertip leaves the image first.
+   -> The pointer now follows the KNUCKLES of the index and middle finger (points 5 and 9). They are far
+      steadier, do not move when you pinch, and sit in the middle of the hand.
+2. Reaching a TV corner needed the hand at the very edge of the camera picture. There MediaPipe only sees
+   part of the hand and guesses the rest, so the points jump (the "earthquake"), or it loses the hand
+   (the pointer disappears).
+   -> The camera area that maps onto the TV is now worked out from the size of YOUR hand in the picture,
+      so the palm and fingers stay fully in view even at the TV corners.
+   -> Frames where the palm is cut off by the picture edge are not trusted: the pointer holds still instead.
+3. The glitch filter gave up after 3 bad frames and snapped to the raw (unsmoothed) value. With frequent bad
+   frames near the edge that snapping repeated: shaking. -> A far jump is only accepted when several frames
+   agree with each other.
+4. Losing the hand for more than 0.25 s removed the pointer. -> It now holds (dimmed) for up to 0.8 s,
+   then disappears, so it never sticks for long in a wrong place.
+5. Smoothing settings were tuned for the noisy fingertip, so the pointer lagged. The steadier knuckles need
+   much less smoothing; speed-based smoothing (One Euro filter) keeps slow moves steady and fast moves quick.
+"""
+import math
+from collections import deque
+
+ASPECT = 16 / 9  # TV width / height, so distances are measured the same way across and down
+
+# MediaPipe hand point numbers used here
+WRIST, INDEX_MCP, MIDDLE_MCP, RING_MCP, PINKY_MCP = 0, 5, 9, 13, 17
+KNUCKLES = (INDEX_MCP, MIDDLE_MCP, RING_MCP, PINKY_MCP)  # must be in the picture for the pointer to be trusted
+
+# How far the hand reaches from the pointer point (between the two knuckles), in palm lengths
+# (palm length = wrist to middle knuckle). Used to keep the whole hand in the picture at the TV edges.
+REACH_UP = 0.85      # fingertips above the knuckles (needed to see a pinch)
+REACH_DOWN = 1.05    # wrist below the knuckles
+REACH_SIDE = 0.65    # thumb / little finger to the side
+EDGE_GAP = 0.03      # extra space to the picture edge (fraction of the picture)
+MIN_ACTIVE = 0.30    # the active area is never smaller than this part of the picture (hand very close)
+PALM_AVERAGE_S = 2.0 # hand size is averaged slowly, so the mapping does not wobble
+IN_PICTURE = 0.005   # a point closer than this to the picture edge counts as cut off
+
+HOLD_S = 0.8             # hand lost or not trusted: keep the pointer (dimmed) this long, then hide it
+MAX_SPEED = 4.0          # TV widths per second; a faster jump between two frames is suspicious...
+MIN_JUMP = 0.06          # (never treat a move smaller than this as suspicious, even at high frame rates)
+JUMP_CONFIRM_FRAMES = 3  # ...and only accepted when this many frames in a row form a smooth path
+
+CORNER_RADIUS = 0.06     # how close (TV widths) the pointer must be to grab a corner
+EDGE_RADIUS = 0.045      # ...or the middle of a side (resize)
+HOVER_KEEP = 1.4         # once hovering, stay hovering until this many radii away (no flicker)
+PINCH_START_FRAMES = 2   # pinch must be seen this many frames before it grabs
+PINCH_END_FRAMES = 3     # open fingers must be seen this many frames before it lets go
+PHONE_UPDATE_S = 0.1     # while dragging, update the phone at most 10 times a second
+
+
+def clamp01(v: float) -> float:
+    return min(1.0, max(0.0, v))
+
+
+def screen_dist(a, b) -> float:
+    """Distance between two TV points in TV widths (vertical distances scaled to match)."""
+    return math.hypot(a[0] - b[0], (a[1] - b[1]) / ASPECT)
+
+
+class OneEuroFilter2D:
+    """The One Euro filter (Casiez et al., CHI 2012) for a 2D point.
+    Strong smoothing when the hand is still (no jitter), little smoothing when it moves fast (little delay).
+    Both axes share one speed, so diagonal moves do not wobble."""
+
+    def __init__(self, min_cutoff: float = 1.0, beta: float = 10.0, d_cutoff: float = 2.0):
+        self.min_cutoff, self.beta, self.d_cutoff = min_cutoff, beta, d_cutoff
+        self.reset()
+
+    def reset(self):
+        self.p = None
+        self.v = (0.0, 0.0)
+        self.t = 0.0
+
+    @staticmethod
+    def _alpha(cutoff: float, dt: float) -> float:
+        tau = 1.0 / (2 * math.pi * cutoff)
+        return 1.0 / (1.0 + tau / dt)
+
+    def __call__(self, p, t: float):
+        if self.p is None:
+            self.p, self.t = p, t
+            return p
+        dt = max(t - self.t, 1e-3)
+        self.t = t
+        a_d = self._alpha(self.d_cutoff, dt)
+        self.v = tuple(a_d * ((n - o) / dt) + (1 - a_d) * vo for n, o, vo in zip(p, self.p, self.v))
+        speed = math.hypot(self.v[0], self.v[1] / ASPECT)
+        a = self._alpha(self.min_cutoff + self.beta * speed, dt)
+        self.p = tuple(a * n + (1 - a) * o for n, o in zip(p, self.p))
+        return self.p
+
+
+class ActiveArea:
+    """The part of the camera picture that maps onto the whole TV, sized from the hand in the picture."""
+
+    def __init__(self):
+        self.palm_x = None  # palm length as a fraction of the picture width
+        self.palm_y = None  # ...and of the picture height
+
+    def learn(self, pts, frame_w: int, frame_h: int, dt: float):
+        (wx, wy), (mx, my) = pts[WRIST], pts[MIDDLE_MCP]
+        palm_px = math.hypot((mx - wx) * frame_w, (my - wy) * frame_h)
+        px, py = palm_px / frame_w, palm_px / frame_h
+        if self.palm_x is None:
+            self.palm_x, self.palm_y = px, py
+        else:
+            k = 1 - math.exp(-dt / PALM_AVERAGE_S)
+            self.palm_x += k * (px - self.palm_x)
+            self.palm_y += k * (py - self.palm_y)
+
+    def bounds(self):
+        """(left, right, top, bottom) of the active area, as picture fractions."""
+        px, py = self.palm_x or 0.12, self.palm_y or 0.2
+        left = right = min(REACH_SIDE * px + EDGE_GAP, (1 - MIN_ACTIVE) / 2)
+        top, bottom = REACH_UP * py + EDGE_GAP, REACH_DOWN * py + EDGE_GAP
+        if top + bottom > 1 - MIN_ACTIVE:  # hand very close to the camera: share what is left
+            f = (1 - MIN_ACTIVE) / (top + bottom)
+            top, bottom = top * f, bottom * f
+        return left, 1 - right, top, 1 - bottom
+
+    def to_screen(self, x: float, y: float):
+        """Camera picture fractions -> TV fractions. Not clamped, so the filter sees the true movement."""
+        l, r, t, b = self.bounds()
+        return (x - l) / (r - l), (y - t) / (b - t)
+
+
+def anchor_point(pts):
+    """The pointer point: halfway between the index and middle knuckles."""
+    return ((pts[INDEX_MCP][0] + pts[MIDDLE_MCP][0]) / 2, (pts[INDEX_MCP][1] + pts[MIDDLE_MCP][1]) / 2)
+
+
+def in_picture(p) -> bool:
+    return IN_PICTURE < p[0] < 1 - IN_PICTURE and IN_PICTURE < p[1] < 1 - IN_PICTURE
+
+
+def palm_in_picture(pts) -> bool:
+    """False when a knuckle is cut off by the picture edge (MediaPipe is only guessing the hand then).
+    The wrist may leave the picture: the pointer follows the knuckles, and near the bottom of the
+    picture (or when the hand tilts to pinch) the wrist is the first thing to go."""
+    return all(in_picture(pts[i]) for i in KNUCKLES)
+
+
+class PointerTracker:
+    """Raw hand points in, steady TV pointer out.
+
+    update() returns (pointer, state): pointer is (x, y) in TV fractions or None, state is
+    'tracking' (following the hand), 'holding' (hand lost or not trusted, pointer kept still) or 'lost'."""
+
+    def __init__(self):
+        self.filter = OneEuroFilter2D()
+        self.area = ActiveArea()
+        self.pointer = None
+        self.last_good = -math.inf
+        self.last_t = None
+        self.jumps = []           # recent far-away targets waiting to be confirmed
+        self.last_target = None   # last accepted raw position (before smoothing)
+        self.reason = ""          # why the last frame was not followed (for vision.pointer_check)
+        self.state = "lost"
+
+    def update(self, pts, frame_w: int, frame_h: int, now: float, freeze_area: bool = False):
+        """pts: the 21 hand points as (x, y) picture fractions, or None when there is no hand.
+        freeze_area: True while pinching or dragging, so the mapping cannot shift under the hand."""
+        dt = 0.0 if self.last_t is None else max(0.0, now - self.last_t)
+        self.last_t = now
+
+        if pts is None or len(pts) != 21:
+            self.reason = "no hand"
+            return self._hold(now)
+        if not all(math.isfinite(c) for p in pts for c in p):
+            self.reason = "bad numbers"
+            return self._hold(now)
+        if not palm_in_picture(pts):
+            self.reason = "knuckles cut off"
+            return self._hold(now)
+        self.reason = ""
+
+        if not freeze_area and in_picture(pts[WRIST]):  # hand size needs the wrist
+            self.area.learn(pts, frame_w, frame_h, dt)
+        target = self.area.to_screen(*anchor_point(pts))
+
+        if self.state == "lost" or self.last_target is None:
+            # Starting again after the pointer was hidden: go straight to the hand.
+            # (After a short hold the glitch check below still applies.)
+            self.filter.reset()
+            self.jumps.clear()
+        else:
+            limit = max(MIN_JUMP, MAX_SPEED * max(dt, 1 / 60))
+            if screen_dist(target, self.last_target) > limit:
+                # Faster than a hand moves: usually a tracking glitch. A real fast move continues
+                # smoothly in the next frame; glitches jump about. Hold still until it is clear.
+                j = self.jumps
+                if len(j) == 1:
+                    smooth = screen_dist(target, j[0]) <= limit
+                elif len(j) >= 2:  # keeps going in the same direction at a similar speed
+                    predicted = (2 * j[-1][0] - j[-2][0], 2 * j[-1][1] - j[-2][1])
+                    smooth = screen_dist(target, predicted) <= limit / 2
+                else:
+                    smooth = False
+                self.jumps = j + [target] if smooth else [target]
+                if len(self.jumps) < JUMP_CONFIRM_FRAMES:
+                    self.reason = "glitch ignored"
+                    self.last_good = now
+                    return self.pointer, "holding"  # this frame (and any pinch in it) is not trusted
+                self.filter.reset()
+        self.jumps.clear()
+        self.last_target = target
+
+        fx, fy = self.filter(target, now)
+        self.pointer = (clamp01(fx), clamp01(fy))
+        self.last_good = now
+        self.state = "tracking"
+        return self.pointer, self.state
+
+    def _hold(self, now: float):
+        self.jumps.clear()  # a fast-move path must come from frames right after each other
+        if self.pointer is not None and now - self.last_good <= HOLD_S:
+            self.state = "holding"
+            return self.pointer, self.state
+        self.pointer = None
+        self.filter.reset()
+        self.jumps.clear()
+        self.last_target = None
+        self.state = "lost"
+        return None, self.state
+
+
+# ---------------------------------------------------------------- editing the shape
+
+def centroid(q):
+    return (sum(p[0] for p in q) / 4, sum(p[1] for p in q) / 4)
+
+
+def is_convex(q) -> bool:
+    """True when the four corners make a proper (not folded or twisted) shape."""
+    sign = 0
+    for i in range(4):
+        a, b, c = q[i], q[(i + 1) % 4], q[(i + 2) % 4]
+        cross = (b[0] - a[0]) * (c[1] - b[1]) - (b[1] - a[1]) * (c[0] - b[0])
+        if abs(cross) < 1e-6:
+            return False
+        s = 1 if cross > 0 else -1
+        if sign and s != sign:
+            return False
+        sign = s
+    return True
+
+
+def inside(q, p) -> bool:
+    """Point-in-polygon test (ray casting)."""
+    hit = False
+    for i in range(4):
+        (x1, y1), (x2, y2) = q[i], q[(i + 1) % 4]
+        if (y1 > p[1]) != (y2 > p[1]) and p[0] < x1 + (p[1] - y1) * (x2 - x1) / (y2 - y1):
+            hit = not hit
+    return hit
+
+
+def on_screen(q) -> bool:
+    return all(0 <= x <= 1 and 0 <= y <= 1 for x, y in q)
+
+
+def move_quad(corners, dx, dy):
+    """Moves all four corners by dx, dy (0-1 units) without leaving the screen."""
+    xs = [p[0] for p in corners]
+    ys = [p[1] for p in corners]
+    dx = min(max(dx, -min(xs)), 1 - max(xs))
+    dy = min(max(dy, -min(ys)), 1 - max(ys))
+    return [[x + dx, y + dy] for x, y in corners]
+
+
+def target_name(target) -> str | None:
+    """('corner', 2) -> 'corner:2', for the TV page."""
+    if target is None:
+        return None
+    return target[0] if len(target) == 1 else f"{target[0]}:{target[1]}"
+
+
+class BoundaryEditor:
+    """Hover, grab, drag and release for the projection shape.
+
+    Targets: ('corner', i) moves one corner, ('edge', i) resizes the whole shape from the middle of
+    side i (between corner i and i+1), ('body',) moves the whole shape. Pinching empty space does nothing.
+    """
+
+    def __init__(self):
+        self.hover = None
+        self.drag = None
+        self.grab_pointer = None
+        self.grab_quad = None
+        self.history = deque(maxlen=PINCH_END_FRAMES + 2)
+        self.pinch_frames = 0
+        self.open_frames = 0
+
+    # -- hit testing
+    @staticmethod
+    def _handles(q):
+        corners = [(("corner", i), tuple(q[i]), CORNER_RADIUS) for i in range(4)]
+        edges = [(("edge", i), ((q[i][0] + q[(i + 1) % 4][0]) / 2, (q[i][1] + q[(i + 1) % 4][1]) / 2), EDGE_RADIUS)
+                 for i in range(4)]
+        return corners + edges
+
+    def _find_hover(self, q, p):
+        handles = self._handles(q)
+        if self.hover is not None and self.hover != ("body",):  # stay on the current handle a bit longer
+            for t, pos, r in handles:
+                if t == self.hover and screen_dist(p, pos) < r * HOVER_KEEP:
+                    return t
+        best = min(((screen_dist(p, pos) / r, t) for t, pos, r in handles), key=lambda x: x[0])
+        if best[0] < 1:
+            return best[1]
+        return ("body",) if inside(q, p) else None
+
+    # -- moving
+    def _dragged(self, p):
+        q0, (gx, gy) = self.grab_quad, self.grab_pointer
+        dx, dy = p[0] - gx, p[1] - gy
+        kind = self.drag[0]
+        if kind == "body":
+            return move_quad(q0, dx, dy)
+        if kind == "corner":
+            i = self.drag[1]
+            q = [list(c) for c in q0]
+            q[i] = [clamp01(q0[i][0] + dx), clamp01(q0[i][1] + dy)]
+            return q if is_convex(q) else None
+        # edge: grow or shrink around the centre by how much further the hand is from the centre
+        c = centroid(q0)
+        d0 = screen_dist(self.grab_pointer, c)
+        if d0 < 1e-3:
+            return None
+        f = min(4.0, max(0.25, screen_dist(p, c) / d0))
+        q = [[c[0] + (x - c[0]) * f, c[1] + (y - c[1]) * f] for x, y in q0]
+        return q if on_screen(q) else None
+
+    def update(self, pointer, raw_pinch, corners, now: float):
+        """One frame. pointer: (x, y) TV fractions or None. raw_pinch: True / False, or None when the hand
+        is not clearly visible this frame (then nothing is grabbed or released).
+        corners: the current shape. Returns (new_corners or None, released: bool)."""
+        q = [list(c) for c in corners]
+        if raw_pinch is not None:
+            self.pinch_frames = self.pinch_frames + 1 if raw_pinch else 0
+            self.open_frames = 0 if raw_pinch else self.open_frames + 1
+
+        if self.drag is None:
+            self.hover = None if pointer is None else self._find_hover(q, pointer)
+            if pointer is not None and raw_pinch and self.pinch_frames == PINCH_START_FRAMES and self.hover is not None:
+                self.drag, self.grab_pointer, self.grab_quad = self.hover, pointer, q
+                self.history.clear()
+                self.history.append(q)
+            return None, False
+
+        # Dragging
+        if pointer is None:  # hand lost for longer than the hold time: let go where it is
+            return self._release(use_history=False)
+        if raw_pinch is None:  # hand briefly unclear: keep holding the handle, do not move it
+            return None, False
+        if not raw_pinch:
+            # Fingers opening: hold still, and let go once it is certain.
+            if self.open_frames >= PINCH_END_FRAMES:
+                return self._release(use_history=True)
+            return None, False
+        new = self._dragged(pointer)
+        if new is None:
+            return None, False
+        self.history.append(new)
+        return new, False
+
+    def _release(self, use_history: bool):
+        # Opening the fingers moves them a little in the last frame or two before the release is
+        # recognised, so drop the shape where it was just before that.
+        final = self.history[-2] if use_history and len(self.history) >= 3 else self.history[-1]
+        self.drag = None
+        self.hover = None
+        self.history.clear()
+        return final, True

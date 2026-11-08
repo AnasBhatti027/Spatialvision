@@ -19,11 +19,17 @@
   .mute { color: #A4ADC5; font-size: 22px; line-height: 1.5; }
   .small { color: #586386; font-size: 15px; margin-top: 28px; }
   /* Hand pointer: follows the index fingertip seen by the webcam. */
+  /* Moved with transform (GPU), not left/top (page layout), so it follows every update without delay. */
   #pointer { position: fixed; left: 0; top: 0; width: 34px; height: 34px; margin: -17px 0 0 -17px; border-radius: 50%;
     border: 4px solid #45D9F5; background: rgba(69,217,245,0.25); pointer-events: none; display: none;
-    transition: width .12s, height .12s, margin .12s, background .12s; z-index: 5; }
+    will-change: transform; transition: background .12s, border-color .12s, opacity .2s; z-index: 5; }
+  #pointer.held { opacity: 0.45; }
   #pointer.pinch { width: 20px; height: 20px; margin: -10px 0 0 -10px; background: #45D9F5; border-color: #FFFFFF; }
   #pointer.open_palm { border-color: #9065FF; background: rgba(144,101,255,0.25); }
+  #pointer.hover { border-color: #FFFFFF; }
+  #pointer.drag { width: 16px; height: 16px; margin: -8px 0 0 -8px; background: #FFFFFF; border-color: #45D9F5; }
+  /* Grab handles on the shape, shown while the hand is in view. */
+  #handles { position: fixed; inset: 0; pointer-events: none; z-index: 4; }
   #event { position: fixed; left: 50%; bottom: 28px; transform: translateX(-50%); padding: 8px 18px; border-radius: 20px;
     background: rgba(8,11,22,0.75); color: #45D9F5; font-size: 22px; font-weight: 700; letter-spacing: 1px;
     opacity: 0; transition: opacity .3s; pointer-events: none; z-index: 5; }
@@ -32,6 +38,7 @@
 </head>
 <body>
 <div id="content"></div>
+<canvas id="handles"></canvas>
 <div id="pointer"></div>
 <div id="event"></div>
 <div id="overlay">
@@ -157,17 +164,61 @@ const EVENT_TEXT = { swipe_right: 'SWIPE →', swipe_left: '← SWIPE', pinch: '
 let hideTimer = null;
 let pointerCount = 0;
 function showPointer(m) {
-  // Keep the dot for a moment when the hand is lost for a frame or two, so it does not blink.
+  // The backend already keeps the dot (dimmed) while the hand is briefly lost, so hide it as soon as it says so.
   if (!m.visible) {
-    if (!hideTimer) hideTimer = setTimeout(() => { pointerEl.style.display = 'none'; hideTimer = null; }, 300);
+    if (!hideTimer) hideTimer = setTimeout(() => { pointerEl.style.display = 'none'; hideTimer = null; }, 100);
     return;
   }
   clearTimeout(hideTimer); hideTimer = null;
   pointerEl.style.display = 'block';
-  pointerEl.style.left = (m.x * window.innerWidth) + 'px';
-  pointerEl.style.top = (m.y * window.innerHeight) + 'px';
-  pointerEl.className = m.gesture === 'pinch' || m.gesture === 'open_palm' ? m.gesture : '';
+  pointerEl.style.transform = `translate3d(${m.x * window.innerWidth}px, ${m.y * window.innerHeight}px, 0)`;
+  pointerEl.className = (m.drag ? 'drag' : m.hover ? 'hover' : (m.gesture === 'pinch' || m.gesture === 'open_palm' ? m.gesture : ''))
+    + (m.held ? ' held' : '');
 }
+// ---------- Grab handles: corners (move a corner), side middles (resize), centre (move all) ----------
+const handlesEl = document.getElementById('handles');
+let handState = { show: false, hover: null, drag: null };
+let handlesHideTimer = null;
+function drawHandles() {
+  const W = window.innerWidth, H = window.innerHeight, dpr = window.devicePixelRatio || 1;
+  if (handlesEl.width !== W * dpr || handlesEl.height !== H * dpr) { handlesEl.width = W * dpr; handlesEl.height = H * dpr; }
+  const g = handlesEl.getContext('2d');
+  g.setTransform(dpr, 0, 0, dpr, 0, 0);
+  g.clearRect(0, 0, W, H);
+  if (!handState.show) return;
+  const q = scene.corners.map(([x, y]) => [x * W, y * H]);
+  const active = handState.drag || handState.hover;
+  const dragging = !!handState.drag;
+  // Outline of the shape, brighter while moving or resizing the whole shape.
+  const whole = active === 'body' || (active || '').startsWith('edge');
+  g.lineWidth = whole ? 4 : 2;
+  g.strokeStyle = whole ? (dragging ? '#FFFFFF' : '#45D9F5') : 'rgba(69,217,245,0.6)';
+  g.beginPath(); q.forEach(([x, y], i) => (i ? g.lineTo(x, y) : g.moveTo(x, y))); g.closePath(); g.stroke();
+  const dot = (x, y, r, on, square) => {
+    g.lineWidth = 3;
+    g.fillStyle = on ? (dragging ? '#FFFFFF' : '#45D9F5') : 'rgba(144,101,255,0.85)';
+    g.strokeStyle = on ? '#45D9F5' : '#FFFFFF';
+    g.beginPath();
+    if (square) g.rect(x - r, y - r, 2 * r, 2 * r); else g.arc(x, y, r, 0, Math.PI * 2);
+    g.fill(); g.stroke();
+  };
+  for (let i = 0; i < 4; i++) {
+    const a = q[i], b = q[(i + 1) % 4];
+    dot((a[0] + b[0]) / 2, (a[1] + b[1]) / 2, active === 'edge:' + i ? 11 : 7, active === 'edge:' + i, true);
+  }
+  q.forEach(([x, y], i) => dot(x, y, active === 'corner:' + i ? 20 : 13, active === 'corner:' + i, false));
+}
+function updateHandles(m) {
+  if (m.visible) {
+    clearTimeout(handlesHideTimer); handlesHideTimer = null;
+    handState = { show: true, hover: m.hover || null, drag: m.drag || null };
+    drawHandles();
+  } else if (!handlesHideTimer) {
+    handlesHideTimer = setTimeout(() => { handState = { show: false, hover: null, drag: null }; drawHandles(); handlesHideTimer = null; }, 1500);
+  }
+}
+window.addEventListener('resize', drawHandles);
+
 function showEvent(name) {
   eventEl.textContent = EVENT_TEXT[name] || name;
   eventEl.classList.add('show');
@@ -185,9 +236,10 @@ function connect() {
     } else if (m.type === 'phones') {
       phones = m.count; showOverlay();
     } else if (m.type === 'scene') {
-      scene = Object.assign(scene, m); render();
+      scene = Object.assign(scene, m); render(); drawHandles();
     } else if (m.type === 'pointer') {
       showPointer(m);
+      updateHandles(m);
       // Every 5th pointer: once it is drawn, send its time back so the backend can measure the delay.
       if (m.visible && m.t !== undefined && ++pointerCount % 5 === 0) {
         requestAnimationFrame(() => { if (ws.readyState === 1) ws.send(JSON.stringify({ type: 'pointer_ack', t: m.t })); });

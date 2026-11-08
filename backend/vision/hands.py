@@ -33,7 +33,8 @@ PINKY_MCP, PINKY_PIP, PINKY_TIP = 17, 18, 20
 CONNECTIONS = [(0, 1), (1, 2), (2, 3), (3, 4), (0, 5), (5, 6), (6, 7), (7, 8), (5, 9), (9, 10), (10, 11), (11, 12),
                (9, 13), (13, 14), (14, 15), (15, 16), (13, 17), (17, 18), (18, 19), (19, 20), (0, 17)]
 
-PINCH_RATIO = 0.30      # thumb tip to index tip, relative to palm size
+PINCH_RATIO = 0.30      # thumb tip to index tip, relative to palm size: closer than this starts a pinch
+PINCH_RELEASE_RATIO = 0.45  # ...and an ongoing pinch only ends once they are further apart than this (no flicker)
 HOLD_FRAMES = 3         # a gesture must be seen this many frames in a row before it counts (3 at 30 fps = 100 ms)
 SWIPE_WINDOW_S = 0.40   # a swipe must happen within this time
 SWIPE_DISTANCE = 0.30   # ...and move this far across the picture (fraction of its width)
@@ -44,13 +45,15 @@ def dist(a, b) -> float:
     return math.hypot(a.x - b.x, a.y - b.y)
 
 
-def classify(lm) -> str:
-    """Names the hand shape from the 21 points. Uses distances only, so it works at any hand angle."""
+def classify(lm, was_pinching: bool = False) -> str:
+    """Names the hand shape from the 21 points. Uses distances only, so it works at any hand angle.
+    was_pinching: pass True while a pinch is held, so it needs a clearer opening to end."""
     palm = dist(lm[WRIST], lm[MIDDLE_MCP]) or 1e-6
     # Pinch: thumb and index tips touch while the index finger still reaches forward
     # (in a fist the thumb also rests near the index tip, but the index is curled back).
     index_forward = dist(lm[WRIST], lm[INDEX_TIP]) > dist(lm[WRIST], lm[INDEX_PIP])
-    if index_forward and dist(lm[THUMB_TIP], lm[INDEX_TIP]) / palm < PINCH_RATIO:
+    limit = PINCH_RELEASE_RATIO if was_pinching else PINCH_RATIO
+    if index_forward and dist(lm[THUMB_TIP], lm[INDEX_TIP]) / palm < limit:
         return "pinch"
     # A finger is extended when its tip is further from the wrist than its middle joint.
     fingers = [dist(lm[WRIST], lm[tip]) > dist(lm[WRIST], lm[pip]) * 1.15

@@ -333,7 +333,7 @@ export default function SpatialVisionHome() {
   const proj = useProjectionScene(send, connected);
   onServerMessage.current = (m) => {
     if (m.type === 'scene') proj.applyRemote(m);
-    else if (m.type === 'vision_status') setVision({ running: !!m.running, fps: m.fps ?? null, detect_ms: m.detect_ms ?? null, latency_ms: m.latency_ms ?? null, error: m.error ?? null });
+    else if (m.type === 'vision_status') setVision({ running: !!m.running, source: m.source ?? null, fps: m.fps ?? null, detect_ms: m.detect_ms ?? null, latency_ms: m.latency_ms ?? null, error: m.error ?? null });
     else if (m.type === 'gesture') setLastGesture(m.name);
   };
   const P = PRESETS[preset];
@@ -462,10 +462,10 @@ export default function SpatialVisionHome() {
 
           {route === 'calibration' && (<>
             <Head t="Projection Editor" sub="Drag the corners onto the surface. The TV updates live." />
-            <ProjectionEditor T={T} scene={proj.scene} update={proj.update} setCorners={proj.setCorners} reset={proj.reset}
+            <ProjectionEditor T={T} scene={proj.scene} update={proj.update} setCorners={proj.setCorners} sendLive={proj.sendLive} reset={proj.reset}
               connected={connected} tvConnected={tvConnected} server={`${ip.trim()}:${port}`} token={user?.token}
               onGoConnect={() => setRoute('connect')} onDragging={setDragging}
-              vision={vision} lastGesture={lastGesture} onGestures={(on) => send({ type: on ? 'start_gestures' : 'stop_gestures' })} />
+              vision={vision} lastGesture={lastGesture} onGestures={(on) => send(on ? { type: 'start_gestures', source: 'phone' } : { type: 'stop_gestures' })} send={send} />
           </>)}
 
           {route === 'tracking' && (<>

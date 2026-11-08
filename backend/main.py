@@ -59,15 +59,17 @@ class Hub:
     async def phones_changed(self):
         await self.to_tv({"type": "phones", "count": len(self.phones)})
 
-    async def update_scene(self, changes: dict):
-        """Used by gestures: changes part of the scene and tells the TV and the phones."""
+    async def update_scene(self, changes: dict, phones: bool = True):
+        """Used by gestures: changes part of the scene and tells the TV (and the phones, unless phones=False)."""
         self.scene = {**self.scene, **changes}
         await self.to_tv(self.scene)
-        await self.to_phones(self.scene)
+        if phones:
+            await self.to_phones(self.scene)
 
 
 hub = Hub()
 gestures = GestureService(hub)
+gesture_phone = {"ws": None}  # the phone whose camera is the gesture source
 
 
 @app.on_event("shutdown")
@@ -119,8 +121,15 @@ async def phone_socket(ws: WebSocket, code: str = ""):
         while True:
             data = await ws.receive_json()
             kind = data.get("type")
+            if kind == "hand":  # hand points from the phone's camera; never forwarded to the TV
+                if ws is gesture_phone["ws"]:
+                    gestures.on_phone_hand(data)
+                continue
             if kind == "start_gestures":
-                gestures.start(asyncio.get_running_loop())
+                # Default: the phone's own camera. The PC webcam is only used when asked for by name.
+                source = "webcam" if data.get("source") == "webcam" else "phone"
+                gesture_phone["ws"] = ws if source == "phone" else None
+                gestures.start(asyncio.get_running_loop(), source)
                 continue
             if kind == "stop_gestures":
                 gestures.stop()
@@ -132,6 +141,9 @@ async def phone_socket(ws: WebSocket, code: str = ""):
         pass
     finally:
         hub.phones.discard(ws)
+        if gesture_phone["ws"] is ws:  # the camera phone left: stop gestures, never switch to the webcam
+            gesture_phone["ws"] = None
+            gestures.phone_gone()
         await hub.phones_changed()
 
 
