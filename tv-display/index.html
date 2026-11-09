@@ -7,10 +7,8 @@
 <style>
   html, body { margin: 0; height: 100%; background: #000; overflow: hidden; font-family: system-ui, Segoe UI, Roboto, sans-serif; }
   body.paired { cursor: none; }
-  /* The mapped content. It is screen-sized and then warped onto the four corners. */
-  #content { position: absolute; left: 0; top: 0; transform-origin: 0 0; overflow: hidden; background: #000; }
-  #content img { width: 100%; height: 100%; display: block; }
-  #content canvas { position: absolute; inset: 0; }
+  /* All surfaces are drawn on this one canvas with WebGL (built into the browser). */
+  #stage { position: fixed; left: 0; top: 0; width: 100%; height: 100%; display: block; }
   #overlay { position: fixed; inset: 0; display: flex; flex-direction: column; align-items: center; justify-content: center;
     background: #080B16; color: #F4F6FF; text-align: center; padding: 24px; }
   #overlay.hidden { display: none; }
@@ -37,7 +35,7 @@
 </style>
 </head>
 <body>
-<div id="content"></div>
+<canvas id="stage"></canvas>
 <canvas id="handles"></canvas>
 <div id="pointer"></div>
 <div id="event"></div>
@@ -48,45 +46,92 @@
   <div class="small">Double-click or press F11 for full screen.</div>
 </div>
 <script>
-// ---------- Perspective maths: map the screen rectangle onto 4 corner points ----------
-function adj(m) {
-  return [m[4]*m[8]-m[5]*m[7], m[2]*m[7]-m[1]*m[8], m[1]*m[5]-m[2]*m[4],
-          m[5]*m[6]-m[3]*m[8], m[0]*m[8]-m[2]*m[6], m[2]*m[3]-m[0]*m[5],
-          m[3]*m[7]-m[4]*m[6], m[1]*m[6]-m[0]*m[7], m[0]*m[4]-m[1]*m[3]];
-}
-function mulMM(a, b) {
-  const c = [];
-  for (let i = 0; i < 3; i++) for (let j = 0; j < 3; j++) {
-    let s = 0; for (let k = 0; k < 3; k++) s += a[3*i+k] * b[3*k+j]; c[3*i+j] = s;
+// ---------- Maths: where a point of a surface lands on the screen ----------
+// Each surface has 4 corners on the screen (fractions 0..1). Inside it, (u, v) runs from (0, 0) at corner 1
+// to (1, 1) at corner 3. Optional warp points (mesh) bend (u, v) first; then the 4 corners give the perspective.
+// The phone app uses exactly the same maths (projection.ts), so the phone preview matches the TV.
+function squareToQuad(q) {
+  const [[x0, y0], [x1, y1], [x2, y2], [x3, y3]] = q;
+  const dx1 = x1 - x2, dx2 = x3 - x2, dx3 = x0 - x1 + x2 - x3;
+  const dy1 = y1 - y2, dy2 = y3 - y2, dy3 = y0 - y1 + y2 - y3;
+  let g = 0, h = 0;
+  if (Math.abs(dx3) > 1e-9 || Math.abs(dy3) > 1e-9) {
+    const det = dx1 * dy2 - dx2 * dy1;
+    if (Math.abs(det) < 1e-9) return null;
+    g = (dx3 * dy2 - dx2 * dy3) / det;
+    h = (dx1 * dy3 - dx3 * dy1) / det;
   }
-  return c;
+  const a = x1 - x0 + g * x1, b = x3 - x0 + h * x3, c = x0;
+  const d = y1 - y0 + g * y1, e = y3 - y0 + h * y3, f = y0;
+  if ([[0, 0], [1, 0], [1, 1], [0, 1]].some(([u, v]) => g * u + h * v + 1 <= 1e-6)) return null; // folded shape
+  return (u, v) => { const w = g * u + h * v + 1; return [(a * u + b * v + c) / w, (d * u + e * v + f) / w]; };
 }
-function mulMV(m, v) {
-  return [m[0]*v[0]+m[1]*v[1]+m[2]*v[2], m[3]*v[0]+m[4]*v[1]+m[5]*v[2], m[6]*v[0]+m[7]*v[1]+m[8]*v[2]];
+// Smooth curve through the warp points (Catmull-Rom), so a bent surface has no creases between cells.
+// With the points in their starting grid it changes nothing.
+function crv(a, b, c, d, t) {
+  const t2 = t * t, t3 = t2 * t;
+  return 0.5 * (2 * b + (c - a) * t + (2 * a - 5 * b + 4 * c - d) * t2 + (3 * b - a - 3 * c + d) * t3);
 }
-function basis(p) { // p = [[x,y] x4] in order TL, TR, BL, BR
-  const m = [p[0][0], p[1][0], p[2][0], p[0][1], p[1][1], p[2][1], 1, 1, 1];
-  const v = mulMV(adj(m), [p[3][0], p[3][1], 1]);
-  return mulMM(m, [v[0], 0, 0, 0, v[1], 0, 0, 0, v[2]]);
+function node(m, a, b) {  // a warp point; outside the grid it continues the edge in a straight line
+  const ext = (p, q) => [2 * p[0] - q[0], 2 * p[1] - q[1]];
+  if (a < 0) return ext(node(m, 0, b), node(m, 1, b));
+  if (a > m.cols) return ext(node(m, m.cols, b), node(m, m.cols - 1, b));
+  if (b < 0) return ext(node(m, a, 0), node(m, a, 1));
+  if (b > m.rows) return ext(node(m, a, m.rows), node(m, a, m.rows - 1));
+  return m.pts[b * (m.cols + 1) + a];
 }
-// Returns a CSS matrix3d() that maps a W x H box onto dst = [TL, TR, BR, BL] in pixels.
-function quadToCss(W, H, dst) {
-  const src = [[0, 0], [W, 0], [0, H], [W, H]];
-  const d = [dst[0], dst[1], dst[3], dst[2]];
-  const t = mulMM(basis(d), adj(basis(src)));
-  for (let i = 0; i < 9; i++) t[i] /= t[8];
-  return `matrix3d(${t[0]},${t[3]},0,${t[6]},${t[1]},${t[4]},0,${t[7]},0,0,1,0,${t[2]},${t[5]},0,${t[8]})`;
+function meshAt(m, u, v) {
+  const i = Math.min(Math.max(Math.floor(u * m.cols), 0), m.cols - 1), j = Math.min(Math.max(Math.floor(v * m.rows), 0), m.rows - 1);
+  const s = u * m.cols - i, t = v * m.rows - j, rows = [];
+  for (let k = -1; k <= 2; k++) {
+    const P = [node(m, i - 1, j + k), node(m, i, j + k), node(m, i + 1, j + k), node(m, i + 2, j + k)];
+    rows.push([crv(P[0][0], P[1][0], P[2][0], P[3][0], s), crv(P[0][1], P[1][1], P[2][1], P[3][1], s)]);
+  }
+  return [crv(rows[0][0], rows[1][0], rows[2][0], rows[3][0], t), crv(rows[0][1], rows[1][1], rows[2][1], rows[3][1], t)];
+}
+function warpFn(surf, corners) {
+  const H = squareToQuad(corners);
+  if (!H) return null;
+  return surf.mesh ? (u, v) => { const m = meshAt(surf.mesh, u, v); return H(m[0], m[1]); } : H;
 }
 
-// ---------- Drawing ----------
-const content = document.getElementById('content');
+// ---------- WebGL drawing ----------
+const stage = document.getElementById('stage');
 const overlay = document.getElementById('overlay');
-let scene = { type: 'scene', corners: [[0, 0], [1, 0], [1, 1], [0, 1]], content: 'pattern', fit: 'contain', grid: false, image_url: null };
-let shownKey = '';
+const gl = stage.getContext('webgl', { alpha: false, antialias: true, premultipliedAlpha: true });
+let prog = null, posBuf = null, uvBuf = null, idxBuf = null, uOpacity = null;
+if (gl) {
+  const sh = (type, src) => { const x = gl.createShader(type); gl.shaderSource(x, src); gl.compileShader(x); return x; };
+  prog = gl.createProgram();
+  gl.attachShader(prog, sh(gl.VERTEX_SHADER, 'attribute vec2 aPos; attribute vec2 aUv; varying vec2 vUv;' +
+    'void main(){ vUv = aUv; gl_Position = vec4(aPos.x * 2.0 - 1.0, 1.0 - aPos.y * 2.0, 0.0, 1.0); }'));
+  gl.attachShader(prog, sh(gl.FRAGMENT_SHADER, 'precision mediump float; varying vec2 vUv; uniform sampler2D uTex; uniform float uOpacity;' +
+    'void main(){ gl_FragColor = texture2D(uTex, vUv) * uOpacity; }'));
+  gl.linkProgram(prog); gl.useProgram(prog);
+  posBuf = gl.createBuffer(); uvBuf = gl.createBuffer(); idxBuf = gl.createBuffer();
+  uOpacity = gl.getUniformLocation(prog, 'uOpacity');
+  gl.enable(gl.BLEND); gl.blendFunc(gl.ONE, gl.ONE_MINUS_SRC_ALPHA);  // surfaces later in the list are drawn on top
+  gl.pixelStorei(gl.UNPACK_PREMULTIPLY_ALPHA_WEBGL, true);
+}
 
-function drawPattern(cv, W, H, grid) {
-  cv.width = W; cv.height = H;
-  const g = cv.getContext('2d');
+let scene = { type: 'scene', surfaces: [], selected: null, blackout: false };
+function selectedSurface() { return scene.surfaces.find((x) => x.id === scene.selected) || scene.surfaces[0] || null; }
+
+// The picture of each surface (content, grid, shape cut-out) is drawn once into a texture and only redrawn
+// when one of those things changes. Moving corners or warp points only moves the mesh, which is cheap.
+const TEX_W = 1280, TEX_H = 720;
+const textures = {};   // surface id -> { key, tex }
+const images = {};     // url -> Image
+function imageFor(url) {
+  if (!images[url]) {
+    const img = new Image();
+    img.onload = () => { for (const id in textures) textures[id].key = ''; needsDraw = true; };
+    img.src = url;
+    images[url] = img;
+  }
+  return images[url];
+}
+function drawPattern(g, W, H, grid, label) {
   const cols = 16, rows = 9, cw = W / cols, ch = H / rows;
   if (!grid) { // full test pattern: checkerboard, centre cross and numbered corners
     for (let r = 0; r < rows; r++) for (let c = 0; c < cols; c++) {
@@ -107,38 +152,136 @@ function drawPattern(cv, W, H, grid) {
   g.textAlign = 'right'; g.fillText('2', W - 24, 20);
   g.textBaseline = 'bottom'; g.fillText('3', W - 24, H - 20);
   g.textAlign = 'left'; g.fillText('4', 24, H - 20);
-}
-
-function render() {
-  const W = window.innerWidth, H = window.innerHeight;
-  content.style.width = W + 'px';
-  content.style.height = H + 'px';
-  const px = scene.corners.map(([x, y]) => [x * W, y * H]);
-  content.style.transform = quadToCss(W, H, px);
-
-  // Only rebuild the inside when the content (not just the corners) changed.
-  const key = [scene.content, scene.image_url, scene.fit, scene.grid, W, H].join('|');
-  if (key === shownKey) return;
-  shownKey = key;
-  content.innerHTML = '';
-  if (scene.content === 'image' && scene.image_url) {
-    const img = document.createElement('img');
-    img.src = scene.image_url;
-    img.style.objectFit = scene.fit === 'cover' ? 'cover' : 'contain';
-    content.appendChild(img);
-  } else if (scene.content === 'pattern') {
-    const cv = document.createElement('canvas');
-    drawPattern(cv, W, H, false);
-    content.appendChild(cv);
-  }
-  if (scene.grid) {
-    const cv = document.createElement('canvas');
-    drawPattern(cv, W, H, true);
-    content.appendChild(cv);
+  if (label) {
+    g.font = `bold ${Math.round(H / 16)}px system-ui, sans-serif`; g.textAlign = 'center'; g.textBaseline = 'top';
+    g.fillText(label, W / 2, H / 2 + 80);
   }
 }
-window.addEventListener('resize', render);
-render();
+function polygon(g, pts, W, H) {
+  g.beginPath(); pts.forEach(([u, v], i) => (i ? g.lineTo(u * W, v * H) : g.moveTo(u * W, v * H))); g.closePath();
+}
+function paintTexture(surf) {
+  const W = TEX_W, H = TEX_H;
+  const cv = document.createElement('canvas'); cv.width = W; cv.height = H;
+  const g = cv.getContext('2d');
+  g.save();
+  // Flip (for rear projection or a mirrored set-up). The shape outline is not flipped.
+  g.translate(surf.flipX ? W : 0, surf.flipY ? H : 0); g.scale(surf.flipX ? -1 : 1, surf.flipY ? -1 : 1);
+  if (surf.content === 'pattern') drawPattern(g, W, H, false, surf.name);
+  else if (surf.content === 'grid') drawPattern(g, W, H, true);
+  else if (surf.content === 'color') { g.fillStyle = surf.color || '#4D7CFE'; g.fillRect(0, 0, W, H); }
+  else if (surf.content === 'image' && surf.image_url) {
+    const img = imageFor(surf.image_url);
+    if (img.complete && img.naturalWidth) {
+      const sc = (surf.fit === 'cover' ? Math.max : Math.min)(W / img.naturalWidth, H / img.naturalHeight);
+      const iw = img.naturalWidth * sc, ih = img.naturalHeight * sc;
+      g.drawImage(img, (W - iw) / 2, (H - ih) / 2, iw, ih);
+    }
+  }
+  if (surf.grid && surf.content !== 'grid') drawPattern(g, W, H, true);
+  g.restore();
+  // Shape cut-out and soft edges (feather): keep the picture only inside the outline.
+  const outline = surf.mask || [[0, 0], [1, 0], [1, 1], [0, 1]];
+  if (surf.mask || surf.feather > 0) {
+    const m = document.createElement('canvas'); m.width = W; m.height = H;
+    const mg = m.getContext('2d');
+    mg.fillStyle = '#fff'; polygon(mg, outline, W, H); mg.fill();
+    let cut = m;
+    const r = (surf.feather || 0) * Math.min(W, H);
+    if (r > 0) {
+      // Move the edge inwards by r, then blur it, so the picture fades to nothing at the outline.
+      mg.globalCompositeOperation = 'destination-out'; mg.lineWidth = 2 * r; mg.lineJoin = 'round';
+      polygon(mg, outline, W, H); mg.stroke();
+      cut = document.createElement('canvas'); cut.width = W; cut.height = H;
+      const cg = cut.getContext('2d'); cg.filter = `blur(${r / 2}px)`; cg.drawImage(m, 0, 0);
+    }
+    g.globalCompositeOperation = 'destination-in'; g.drawImage(cut, 0, 0);
+  }
+  return cv;
+}
+function textureFor(surf) {
+  const key = JSON.stringify([surf.content, surf.image_url, surf.fit, surf.grid, surf.color, surf.mask, surf.feather,
+    surf.flipX, surf.flipY, surf.content === 'pattern' ? surf.name : '', images[surf.image_url]?.complete]);
+  let t = textures[surf.id];
+  if (!t) t = textures[surf.id] = { key: null, tex: gl.createTexture() };
+  if (t.key !== key) {
+    t.key = key;
+    gl.bindTexture(gl.TEXTURE_2D, t.tex);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, paintTexture(surf));
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+  }
+  return t.tex;
+}
+// Triangle list for an n x n grid (the same for every surface with that n).
+const indexCache = {};
+function indicesFor(n) {
+  if (!indexCache[n]) {
+    const out = [];
+    for (let j = 0; j < n; j++) for (let i = 0; i < n; i++) {
+      const a = j * (n + 1) + i, b = a + 1, c = a + n + 2, d = a + n + 1;
+      out.push(a, b, c, a, c, d);
+    }
+    indexCache[n] = new Uint16Array(out);
+  }
+  return indexCache[n];
+}
+let needsDraw = true;
+function drawScene() {
+  needsDraw = false;
+  if (!gl) return;
+  const W = window.innerWidth, H = window.innerHeight, dpr = window.devicePixelRatio || 1;
+  if (stage.width !== Math.round(W * dpr) || stage.height !== Math.round(H * dpr)) {
+    stage.width = Math.round(W * dpr); stage.height = Math.round(H * dpr);
+  }
+  gl.viewport(0, 0, stage.width, stage.height);
+  gl.clearColor(0, 0, 0, 1); gl.clear(gl.COLOR_BUFFER_BIT);
+  if (scene.blackout) return;
+  for (const surf of scene.surfaces) {
+    if (!surf.visible || surf.content === 'blank' || !(surf.opacity > 0)) continue;
+    const corners = surf.id === scene.selected && motion.corners ? motion.corners : surf.corners;
+    const warp = warpFn(surf, corners);
+    if (!warp) continue;
+    // Fine enough that the straight pieces follow the perspective and the warp without visible bends.
+    const n = Math.min(48, Math.max(16, surf.mesh ? Math.max(surf.mesh.cols, surf.mesh.rows) * 8 : 16));
+    const pos = new Float32Array((n + 1) * (n + 1) * 2), uv = new Float32Array((n + 1) * (n + 1) * 2);
+    for (let j = 0, k = 0; j <= n; j++) for (let i = 0; i <= n; i++, k += 2) {
+      const u = i / n, v = j / n, p = warp(u, v);
+      pos[k] = p[0]; pos[k + 1] = p[1]; uv[k] = u; uv[k + 1] = v;
+    }
+    const tex = textureFor(surf);
+    gl.bindBuffer(gl.ARRAY_BUFFER, posBuf); gl.bufferData(gl.ARRAY_BUFFER, pos, gl.DYNAMIC_DRAW);
+    const aPos = gl.getAttribLocation(prog, 'aPos'); gl.enableVertexAttribArray(aPos); gl.vertexAttribPointer(aPos, 2, gl.FLOAT, false, 0, 0);
+    gl.bindBuffer(gl.ARRAY_BUFFER, uvBuf); gl.bufferData(gl.ARRAY_BUFFER, uv, gl.DYNAMIC_DRAW);
+    const aUv = gl.getAttribLocation(prog, 'aUv'); gl.enableVertexAttribArray(aUv); gl.vertexAttribPointer(aUv, 2, gl.FLOAT, false, 0, 0);
+    gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, idxBuf); gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, indicesFor(n), gl.DYNAMIC_DRAW);
+    gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, tex);
+    gl.uniform1f(uOpacity, surf.opacity);
+    gl.drawElements(gl.TRIANGLES, n * n * 6, gl.UNSIGNED_SHORT, 0);
+  }
+  // Textures of deleted surfaces are freed.
+  for (const id in textures) if (!scene.surfaces.some((x) => x.id === id)) { gl.deleteTexture(textures[id].tex); delete textures[id]; }
+}
+/** Turns any scene message into the surfaces form (an old backend sends only one shape). */
+function applyScene(m) {
+  if (!Array.isArray(m.surfaces)) {
+    const one = Object.assign({ id: 's1', name: 'Surface 1', mesh: null, mask: null, color: '#4D7CFE', opacity: 1, feather: 0,
+      flipX: false, flipY: false, visible: true, locked: false, content: 'pattern', fit: 'contain', grid: false, image_url: null },
+      scene.surfaces[0] || {}, m);
+    m = { surfaces: [one], selected: one.id, blackout: false };
+  }
+  scene = { type: 'scene', surfaces: m.surfaces, selected: m.selected, blackout: !!m.blackout };
+  const sel = selectedSurface();
+  if (sel) cornersTarget(sel.id, sel.corners);
+  needsDraw = true;
+}
+
+// Gliding pointer and shape positions (see "Smooth motion between updates" below).
+const motion = { target: null, at: 0, vel: [0, 0], shown: null, cornersTarget: null, corners: null, selId: null };
+window.addEventListener('resize', () => { needsDraw = true; });
+if (!gl) document.getElementById('msg').textContent = 'This browser cannot draw the projection (WebGL is off). Use Chrome or Edge on the PC.';
 
 // ---------- Full screen on double-click ----------
 document.addEventListener('dblclick', () => {
@@ -166,12 +309,12 @@ let pointerCount = 0;
 function showPointer(m) {
   // The backend already keeps the dot (dimmed) while the hand is briefly lost, so hide it as soon as it says so.
   if (!m.visible) {
-    if (!hideTimer) hideTimer = setTimeout(() => { pointerEl.style.display = 'none'; hideTimer = null; }, 100);
+    if (!hideTimer) hideTimer = setTimeout(() => { pointerEl.style.display = 'none'; motion.target = null; motion.shown = null; hideTimer = null; }, 100);
     return;
   }
   clearTimeout(hideTimer); hideTimer = null;
   pointerEl.style.display = 'block';
-  pointerEl.style.transform = `translate3d(${m.x * window.innerWidth}px, ${m.y * window.innerHeight}px, 0)`;
+  pointerTarget(m.x, m.y, !!m.still);  // the dot glides there (see "Smooth motion" below)
   pointerEl.className = (m.drag ? 'drag' : m.hover ? 'hover' : (m.gesture === 'pinch' || m.gesture === 'open_palm' ? m.gesture : ''))
     + (m.held ? ' held' : '');
 }
@@ -181,12 +324,17 @@ let handState = { show: false, hover: null, drag: null };
 let handlesHideTimer = null;
 function drawHandles() {
   const W = window.innerWidth, H = window.innerHeight, dpr = window.devicePixelRatio || 1;
-  if (handlesEl.width !== W * dpr || handlesEl.height !== H * dpr) { handlesEl.width = W * dpr; handlesEl.height = H * dpr; }
+  if (handlesEl.width !== Math.round(W * dpr) || handlesEl.height !== Math.round(H * dpr)) {
+    handlesEl.width = Math.round(W * dpr); handlesEl.height = Math.round(H * dpr);
+  }
+  // Show the canvas at exactly the window size. Without this it is shown at its pixel size, so with
+  // browser zoom or Windows display scaling the handles were drawn smaller or bigger than the shape.
+  handlesEl.style.width = W + 'px'; handlesEl.style.height = H + 'px';
   const g = handlesEl.getContext('2d');
   g.setTransform(dpr, 0, 0, dpr, 0, 0);
   g.clearRect(0, 0, W, H);
   if (!handState.show) return;
-  const q = scene.corners.map(([x, y]) => [x * W, y * H]);
+  const q = shownCorners().map(([x, y]) => [x * W, y * H]);
   const active = handState.drag || handState.hover;
   const dragging = !!handState.drag;
   // Outline of the shape, brighter while moving the whole shape.
@@ -227,6 +375,72 @@ function updateHandles(m) {
 }
 window.addEventListener('resize', drawHandles);
 
+// ---------- Smooth motion between updates ----------
+// The phone's hand tracking sends a new position only 10-15 times a second, sometimes with pauses
+// (measured 9 Nov on a 5-year-old phone), while this page redraws 60 times a second. Instead of
+// jumping on each update and freezing in between, the pointer and the shape glide to the newest
+// position, and during a short gap the pointer keeps going the way the hand was moving. This runs
+// only here on the display, so the phone does no extra work.
+const GLIDE_S = 0.045;       // how quickly the shown position catches up with the newest one
+const PREDICT_MAX_S = 0.06;  // keep a movement going for at most this long when an update is late
+const PREDICT_MAX = 0.008;   // ...and never more than this far ahead (fraction of the screen), so stops stay crisp
+function pointerTarget(x, y, still) {
+  const now = performance.now() / 1000;
+  if (still) {  // the backend has locked the pointer (hand still, or pinching): stop, no prediction
+    motion.vel = [0, 0];
+  } else if (motion.target) {
+    const dt = now - motion.at;
+    if (dt > 0.005 && dt < 0.3) {
+      const vx = (x - motion.target[0]) / dt, vy = (y - motion.target[1]) / dt;
+      motion.vel = [0.5 * motion.vel[0] + 0.5 * vx, 0.5 * motion.vel[1] + 0.5 * vy];
+    } else if (dt >= 0.3) motion.vel = [0, 0];
+  } else motion.vel = [0, 0];
+  motion.target = [x, y]; motion.at = now;
+  if (!motion.shown) motion.shown = [x, y];
+}
+function cornersTarget(id, c) {
+  motion.cornersTarget = c.map((p) => [p[0], p[1]]);
+  // A newly selected surface starts where it is; only changes of the same surface glide.
+  // Gliding is for hand gestures (a few updates a second). A finger drag on the phone sends ~30 updates
+  // a second, so without a hand in view the shape jumps straight to the newest position (no added delay).
+  if (!motion.corners || motion.selId !== id || !handState.show) motion.corners = c.map((p) => [p[0], p[1]]);
+  motion.selId = id;
+}
+function shownCorners() { return motion.corners || selectedSurface()?.corners || [[0, 0], [1, 0], [1, 1], [0, 1]]; }
+let lastFrame = performance.now() / 1000;
+function frame() {
+  const now = performance.now() / 1000, dt = Math.min(now - lastFrame, 0.1);
+  lastFrame = now;
+  const k = 1 - Math.exp(-dt / GLIDE_S);
+  if (motion.target && motion.shown) {
+    const ahead = Math.min(now - motion.at, PREDICT_MAX_S);
+    let px = motion.vel[0] * ahead, py = motion.vel[1] * ahead;
+    const len = Math.hypot(px, py);
+    if (len > PREDICT_MAX) { px *= PREDICT_MAX / len; py *= PREDICT_MAX / len; }
+    const aimX = Math.min(1, Math.max(0, motion.target[0] + px)), aimY = Math.min(1, Math.max(0, motion.target[1] + py));
+    motion.shown = [motion.shown[0] + (aimX - motion.shown[0]) * k, motion.shown[1] + (aimY - motion.shown[1]) * k];
+    pointerEl.style.transform = `translate3d(${motion.shown[0] * window.innerWidth}px, ${motion.shown[1] * window.innerHeight}px, 0)`;
+  }
+  if (motion.cornersTarget && motion.corners) {
+    let moved = false;
+    motion.corners = motion.corners.map((p, i) => {
+      const t = motion.cornersTarget[i];
+      const nx = p[0] + (t[0] - p[0]) * k, ny = p[1] + (t[1] - p[1]) * k;
+      if (Math.abs(nx - t[0]) > 1e-5 || Math.abs(ny - t[1]) > 1e-5) moved = true;
+      return moved ? [nx, ny] : [nx, ny];
+    });
+    if (moved || motion.cornersMoving) {
+      if (!moved) motion.corners = motion.cornersTarget.map((p) => [p[0], p[1]]);  // settle exactly on the target
+      needsDraw = true;
+      drawHandles();
+    }
+    motion.cornersMoving = moved;
+  }
+  if (needsDraw) drawScene();
+  requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+
 function showEvent(name) {
   eventEl.textContent = EVENT_TEXT[name] || name;
   eventEl.classList.add('show');
@@ -244,7 +458,8 @@ function connect() {
     } else if (m.type === 'phones') {
       phones = m.count; showOverlay();
     } else if (m.type === 'scene') {
-      scene = Object.assign(scene, m); render(); drawHandles();
+      applyScene(m);
+      drawHandles();
     } else if (m.type === 'pointer') {
       showPointer(m);
       updateHandles(m);

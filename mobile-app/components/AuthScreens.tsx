@@ -3,6 +3,7 @@ import {
   ActivityIndicator, KeyboardAvoidingView, Platform, Pressable, ScrollView, StatusBar, StyleSheet, Text, TextInput, View,
 } from 'react-native';
 import { MaterialCommunityIcons as Icon } from '@expo/vector-icons';
+import { BrandEmblem } from './Brand';
 
 type Theme = {
   dark: boolean; bg: string; s1: string; s2: string; blue: string; cyan: string; violet: string;
@@ -121,7 +122,7 @@ export default function AuthScreens({ T, onDone, initialServer }: { T: Theme; on
         <ScrollView contentContainerStyle={s.scroll} keyboardShouldPersistTaps="handled" showsVerticalScrollIndicator={false}>
           <View style={s.glow} />
           <View style={s.brand}>
-            <View style={s.logo}><View style={s.logoOuter} /><View style={s.logoInner} /></View>
+            <BrandEmblem dark={T.dark} size={40} />
             <Text style={s.brandT}>SpatialVision</Text>
           </View>
 
@@ -214,9 +215,6 @@ function makeStyles(T: Theme) {
     scroll: { paddingHorizontal: 24, paddingBottom: 40, paddingTop: 12 },
     glow: { position: 'absolute', top: -60, right: -80, width: 260, height: 260, borderRadius: 130, backgroundColor: T.violet, opacity: T.dark ? 0.16 : 0.1 },
     brand: { flexDirection: 'row', alignItems: 'center', gap: 10, marginBottom: 28 },
-    logo: { width: 30, height: 30, alignItems: 'center', justifyContent: 'center' },
-    logoOuter: { width: 21, height: 21, borderWidth: 2, borderColor: T.cyan, borderRadius: 6, transform: [{ rotate: '45deg' }] },
-    logoInner: { position: 'absolute', width: 8, height: 8, backgroundColor: T.blue, borderRadius: 3, transform: [{ rotate: '45deg' }] },
     brandT: { color: T.text, fontSize: 19, fontWeight: '800' },
     h1: { color: T.text, fontSize: 30, fontWeight: '800', letterSpacing: -0.6 },
     mute: { color: T.mute, fontSize: 14, lineHeight: 20, marginTop: 4 },
@@ -235,4 +233,4 @@ function makeStyles(T: Theme) {
     btnT: { color: '#FFFFFF', fontSize: 16, fontWeight: '700' },
     switch: { alignItems: 'center', paddingVertical: 14 },
   });
-}
+}

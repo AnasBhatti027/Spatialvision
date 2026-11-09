@@ -14,6 +14,7 @@
     "expo-mediapipe": "^0.4.1",
     "expo-modules-core": "~58.0.30",
     "expo-navigation-bar": "~58.0.4",
+    "expo-splash-screen": "~58.0.13",
     "expo-status-bar": "~58.0.4",
     "react": "19.3.0",
     "react-dom": "19.3.0",

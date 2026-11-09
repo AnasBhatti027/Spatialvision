@@ -96,8 +96,14 @@ async def main():
     await send(hand(cx + 0.1 * (r - l), cy + 0.1 * (b - t), pinch=True), 4)
     await send(hand(cx + 0.1 * (r - l), cy + 0.1 * (b - t)), 6)
     c1 = hub.scene["corners"][0]
-    check("pinch-drag moves corner 1 and releases", abs(c1[0] - 0.2) < 0.02 and abs(c1[1] - 0.2) < 0.02 and svc.engine.editor.drag is None,
-          f"corner 1 now {c1[0]:.3f}, {c1[1]:.3f}")
+    # With pointer acceleration a slow drag moves less than the hand (precise), and the first bit of a
+    # pinch-drag is ignored as tremor; what matters is that the corner was moved and dropped near the
+    # pointer (which then rejoins the hand, up to the tremor allowance away).
+    shown = [m for m in hub.tv if m.get("type") == "pointer" and m["visible"]][-1]
+    check("pinch-drag moves corner 1, lands under the pointer, and releases",
+          c1[0] > 0.13 and c1[1] > 0.13 and abs(c1[0] - shown["x"]) < 0.025 and abs(c1[1] - shown["y"]) < 0.025
+          and svc.engine.editor.drag is None,
+          f"corner 1 now {c1[0]:.3f}, {c1[1]:.3f}; pointer {shown['x']:.3f}, {shown['y']:.3f}")
     check("other corners unchanged", hub.scene["corners"][1:] == [[0.9, 0.1], [0.9, 0.9], [0.1, 0.9]])
     scene_to_phone = [m for m in hub.phones if m.get("type") == "scene"]
     check("phone gets the shape once, at release (not during the drag)", len(scene_to_phone) == 1, f"{len(scene_to_phone)} update(s)")

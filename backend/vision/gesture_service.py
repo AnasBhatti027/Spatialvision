@@ -14,16 +14,21 @@ What the hand does:
 Every gesture is also sent to the phones, together with the measured frame rate.
 """
 import asyncio
+import json
 import math
 import statistics
 import threading
 import time
 from collections import Counter, deque, namedtuple
 
-from vision.hands import INDEX_TIP, GestureTracker, classify
-from vision.interaction import PHONE_UPDATE_S, BoundaryEditor, PinchLock, PointerTracker, target_name
+from pathlib import Path
 
-CONTENT_ORDER = ["pattern", "image", "blank"]
+from vision.hands import INDEX_TIP, GestureTracker, classify
+from vision.interaction import (PHONE_UPDATE_S, BoundaryEditor, PinchLock, PointerAcceleration, PointerTracker,
+                                StillLock, target_name)
+
+CONTENT_ORDER = ["pattern", "grid", "color", "image", "blank"]
+LOG_DIR = Path(__file__).resolve().parent.parent / "logs"   # backend/logs, one file per gesture session (ignored by git)
 PHONE_GAP_S = 0.35        # no hand message from the phone for this long: treat as "no hand" (short Wi-Fi pauses are normal)
 CLOCK_WINDOW_S = 5.0      # phone-to-PC clock offset: the quickest delivery seen in this window
 PHONE_SILENT_S = 3.0      # ...for this long: tell the phone user the camera stopped sending
@@ -82,6 +87,35 @@ def phone_points(msg: dict):
     return xy, w, h
 
 
+class GestureLog:
+    """Writes one line per frame to backend/logs/gestures-<date-time>.jsonl while gestures run:
+    the raw hand position, every processing stage of the pointer, the pinch, and what was grabbed.
+    Used to find out from real use (not guesses) where the pointer moves, lags or holds."""
+
+    def __init__(self, source: str):
+        self.file = None
+        try:
+            LOG_DIR.mkdir(exist_ok=True)
+            name = time.strftime("gestures-%Y%m%d-%H%M%S.jsonl")
+            self.file = open(LOG_DIR / name, "w", buffering=1 << 16)
+            self.file.write(json.dumps({"source": source, "started": time.strftime("%Y-%m-%d %H:%M:%S")}) + "\n")
+        except OSError as e:
+            print(f"Gesture log not written: {e}")
+
+    def write(self, row: dict):
+        if self.file:
+            self.file.write(json.dumps(row, separators=(",", ":")) + "\n")
+
+    def close(self):
+        if self.file:
+            self.file.close()
+            self.file = None
+
+
+def r4(p):
+    return None if p is None else [round(p[0], 4), round(p[1], 4)]
+
+
 class GestureEngine:
     """One frame of hand points in -> pointer, gestures and shape edits out. Used by both sources."""
 
@@ -90,12 +124,16 @@ class GestureEngine:
         self.tracker = GestureTracker()
         self.pointer_tracker = PointerTracker()
         self.editor = BoundaryEditor()
+        self.accel = PointerAcceleration()
+        self.still = StillLock()
         self.lock = PinchLock()
         self.frames = Counter()   # frames per state since the last status report (tracking / holding / lost)
         self.reasons = Counter()  # ...and why the pointer was held
         self.pinching = False           # pinch state with hysteresis (see classify)
         self.last_phone_update = 0.0
         self.start = time.perf_counter()
+        self.log = GestureLog(service.source or "?")
+        self.extra: dict = {}            # filled by the phone source: arrival time and pauses, for the log
 
     def process(self, pts, frame_w: int, frame_h: int, at: float):
         """pts: 21 (x, y) picture fractions, already mirrored for a natural feel, or None.
@@ -117,7 +155,14 @@ class GestureEngine:
         else:
             pinch = None
 
-        pointer = self.lock.update(pointer, pinch, at)  # keep the pointer where the pinch started
+        tracked = pointer
+        pointer = self.accel.update(pointer, at)        # slow hand = precise pointer, fast hand = quick pointer
+        accel = pointer
+        if not self.pinching:
+            pointer = self.still.update(pointer, at)    # hand (nearly) still: pointer exactly still
+        else:
+            self.still.reset()
+        pointer = self.lock.update(pointer, pinch, at, dragging=self.editor.drag is not None)  # strict pinch lock
 
         event = self.tracker.update(raw, pts[INDEX_TIP][0] if pts else None, at)
         gesture = self.tracker.stable
@@ -136,10 +181,31 @@ class GestureEngine:
                 self.last_phone_update = at
             svc._change_scene(phones=to_phone, corners=corners)
 
-        svc._send_pointer({"type": "pointer", "visible": pointer is not None, "held": state == "holding",
+        still = (self.still.locked is not None and not self.pinching) or (self.lock.locked and self.lock.base is None)
+        svc._send_pointer({"type": "pointer", "visible": pointer is not None, "held": state == "holding", "still": still,
                            "t": at, "x": pointer[0] if pointer else 0, "y": pointer[1] if pointer else 0,
                            "gesture": "pinch" if self.pinching else gesture,
                            "hover": target_name(self.editor.hover), "drag": target_name(self.editor.drag)})
+
+        row = {"t": round(at - self.start, 4), "state": state, "why": self.pointer_tracker.reason or None,
+               "raw": raw, "pinch": pinch, "tracked": r4(tracked), "accel": r4(accel), "shown": r4(pointer),
+               "hover": target_name(self.editor.hover), "drag": target_name(self.editor.drag),
+               "released": bool(released), "w": frame_w, "h": frame_h}
+        if pts is not None:
+            palm = math.dist(pts[0], pts[9]) or 1e-6
+            row["anchor"] = r4(((pts[5][0] + pts[9][0]) / 2, (pts[5][1] + pts[9][1]) / 2))
+            row["pinch_ratio"] = round(math.dist(pts[4], pts[8]) / palm, 3)
+        if corners is not None:
+            row["corners"] = [r4(c) for c in corners]
+        self.log_count = getattr(self, "log_count", 0) + 1
+        if self.log_count % 15 == 1:  # the camera area mapped onto the TV, twice a second
+            row["area"] = [round(v, 3) for v in self.pointer_tracker.area.bounds()]
+        if self.extra:
+            row.update(self.extra)
+            self.extra = {}
+        if event:
+            row["event"] = event
+        self.log.write(row)
 
         if event:
             message = {"type": "gesture", "name": event, "t": round(at - self.start, 2)}
@@ -258,6 +324,7 @@ class GestureService:
         self.last_frame_at = at
 
         pts, w, h = phone_points(msg)
+        self.engine.extra = {"arrived": round(arrival - self.engine.start, 4), "phone_t": t if isinstance(t, (int, float)) else None}
         self.engine.process(pts, w, h, at)
 
     def phone_gone(self):
@@ -296,6 +363,8 @@ class GestureService:
         except asyncio.CancelledError:
             pass
         finally:
+            if self.engine is not None:
+                self.engine.log.close()
             if asyncio.current_task() is self.phone_task:  # still the active source
                 self._send_pointer({"type": "pointer", "visible": False, "x": 0, "y": 0, "gesture": "none"})
                 self.source = None
@@ -384,6 +453,7 @@ class GestureService:
         finally:
             reader.release()
             landmarker.close()
+            engine.log.close()
             self._send_pointer({"type": "pointer", "visible": False, "x": 0, "y": 0, "gesture": "none"})
             self.source = None
             self._publish_status(running=False, source=None, fps=None, detect_ms=None, latency_ms=None)

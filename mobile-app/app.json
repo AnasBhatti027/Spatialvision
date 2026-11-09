@@ -4,17 +4,15 @@
     "slug": "mobile-app",
     "version": "1.0.0",
     "orientation": "default",
-    "icon": "./assets/icon.png",
+    "icon": "./assets/brand/icon.png",
     "userInterfaceStyle": "automatic",
     "ios": {
       "supportsTablet": true
     },
     "android": {
       "adaptiveIcon": {
-        "backgroundColor": "#E6F4FE",
-        "foregroundImage": "./assets/android-icon-foreground.png",
-        "backgroundImage": "./assets/android-icon-background.png",
-        "monochromeImage": "./assets/android-icon-monochrome.png"
+        "foregroundImage": "./assets/brand/android-icon-foreground.png",
+        "backgroundColor": "#161F2D"
       },
       "predictiveBackGestureEnabled": false,
       "package": "com.szabist.spatialvision",
@@ -23,7 +21,7 @@
       ]
     },
     "web": {
-      "favicon": "./assets/favicon.png"
+      "favicon": "./assets/brand/favicon.png"
     },
     "plugins": [
       [
@@ -33,7 +31,20 @@
         }
       ],
       "expo-font",
-      "expo-status-bar"
+      "expo-status-bar",
+      [
+        "expo-splash-screen",
+        {
+          "image": "./assets/brand/splash-emblem-light-mode.png",
+          "imageWidth": 200,
+          "resizeMode": "contain",
+          "backgroundColor": "#F4F6FC",
+          "dark": {
+            "image": "./assets/brand/splash-emblem-dark-mode.png",
+            "backgroundColor": "#080B16"
+          }
+        }
+      ]
     ],
     "extra": {
       "eas": {

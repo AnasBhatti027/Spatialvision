@@ -40,10 +40,12 @@ SIDE_SAFETY = 1.25   # ...and 25% more than the knuckles were measured to reach 
 EDGE_GAP = 0.03      # extra space to the picture edge (fraction of the picture)
 MIN_ACTIVE = 0.30    # the active area is never smaller than this part of the picture (hand very close)
 PALM_AVERAGE_S = 2.0 # hand size is averaged slowly, so the mapping does not wobble
+COMFORT_W = 4.5      # moving the hand this many palm lengths sideways crosses the whole TV...
+COMFORT_H = 3.0      # ...and this many up and down (the same at any distance from the camera)
 IN_PICTURE = 0.005   # a point closer than this to the picture edge counts as cut off
 
 HOLD_S = 0.8             # hand lost or not trusted: keep the pointer (dimmed) this long, then hide it
-MAX_SPEED = 4.0          # TV widths per second; a faster jump between two frames is suspicious...
+MAX_SPEED = 4.0          # TV widths per second (well above real hand speed); a faster jump between two frames is suspicious...
 MIN_JUMP = 0.06          # (never treat a move smaller than this as suspicious, even at high frame rates)
 JUMP_CONFIRM_FRAMES = 3  # ...and only accepted when this many frames in a row form a smooth path
 
@@ -53,6 +55,19 @@ HOVER_KEEP = 1.4         # once hovering, stay hovering until this many radii aw
 PINCH_START_FRAMES = 2   # pinch must be seen this many frames before it grabs
 PINCH_END_FRAMES = 3     # open fingers must be seen this many frames before it lets go
 PHONE_UPDATE_S = 0.1     # while dragging, update the phone at most 10 times a second
+
+GAIN_SLOW = 0.75         # pointer acceleration: slow hand movement moves the pointer at 75% (a little more precise)...
+GAIN_FAST = 1.1          # ...fast movement at 110% (quick across the screen)
+SPEED_SLOW = 0.12        # hand speed (TV widths per second) at or below which the slow gain applies
+SPEED_FAST = 1.0         # ...and at or above which the fast gain applies
+CATCH_UP = 7.0           # while the hand moves, this fraction per TV width moved pulls the pointer back in line
+EDGE_SNAP_S = 0.12       # hand at the edge of the TV area: the pointer goes all the way there within about this time
+
+STILL_SPEED = 0.06       # still lock: hand slower than this (TV widths per second)...
+STILL_TIME_S = 0.10      # ...for this long locks the pointer exactly in place...
+UNLOCK_DIST = 0.010      # ...until the hand has clearly moved this far (TV widths, about 1% of the screen)
+UNLOCK_GLIDE_S_STILL = 0.08  # after unlocking, the pointer joins the hand over about this time (no jump)
+DRAG_DEADZONE = 0.015    # while pinching a corner or side: hand movement up to this far is ignored (tremor)
 
 LOCK_LOOKBACK_S = 0.10   # pinch lock: the pointer goes back to where it was this long before the pinch was seen
 LOCK_SETTLE_S = 0.15     # ...and stays exactly there while the fingers finish closing
@@ -73,7 +88,7 @@ class OneEuroFilter2D:
     Strong smoothing when the hand is still (no jitter), little smoothing when it moves fast (little delay).
     Both axes share one speed, so diagonal moves do not wobble."""
 
-    def __init__(self, min_cutoff: float = 1.0, beta: float = 10.0, d_cutoff: float = 2.0):
+    def __init__(self, min_cutoff: float = 1.6, beta: float = 10.0, d_cutoff: float = 2.0):
         self.min_cutoff, self.beta, self.d_cutoff = min_cutoff, beta, d_cutoff
         self.reset()
 
@@ -134,7 +149,26 @@ class ActiveArea:
             self.reach_right += k * (rr - self.reach_right)
 
     def bounds(self):
-        """(left, right, top, bottom) of the active area, as picture fractions."""
+        """(left, right, top, bottom) of the active area, as picture fractions.
+
+        The area is a comfortable box measured in palm lengths (COMFORT_W x COMFORT_H), centred in
+        the picture, so the hand movement that crosses the TV is the same whether you stand close
+        to the camera or far from it. Measured 9 Nov: sized only from the picture, the area was 83%
+        of the picture when sitting far from the phone (the hand had to travel very far), and 64%
+        when close (it felt too fast). It never goes beyond the edges where the knuckles stay in view."""
+        l, r, t, b = self._limits()
+        px, py = self.palm_x or 0.12, self.palm_y or 0.2
+        want_w, want_h = COMFORT_W * px, COMFORT_H * py
+        if want_w < r - l:
+            cx = min(max(0.5, l + want_w / 2), r - want_w / 2)
+            l, r = cx - want_w / 2, cx + want_w / 2
+        if want_h < b - t:
+            cy = min(max(0.5, t + want_h / 2), b - want_h / 2)
+            t, b = cy - want_h / 2, cy + want_h / 2
+        return l, r, t, b
+
+    def _limits(self):
+        """The largest area where the knuckles (and fingertips for a pinch) stay in the picture."""
         px, py = self.palm_x or 0.12, self.palm_y or 0.2
         side_min = SIDE_MIN * px  # never less than this, so a hand turning a little still fits
         left = max(self.reach_left or 0.0, side_min) * SIDE_SAFETY + EDGE_GAP
@@ -254,8 +288,105 @@ class PointerTracker:
         return None, self.state
 
 
+class PointerAcceleration:
+    """Like a computer mouse: slow hand movement moves the pointer less (precise placing), fast
+    movement moves it fully (quick across the screen).
+
+    Without this, the camera area that maps onto the whole TV is small, so a small slow hand
+    movement became a big pointer jump ("slipping"). Because a slower pointer would drift away from
+    where the hand is, the pointer is pulled back in line while the hand moves, in proportion to the
+    movement: when the hand is still nothing moves, so the pointer never creeps on its own."""
+
+    def __init__(self):
+        self.reset()
+
+    def reset(self):
+        self.hand = None     # previous hand position (TV fractions, before acceleration)
+        self.out = None      # pointer shown
+        self.last_t = None
+
+    def update(self, pointer, at: float):
+        if pointer is None:
+            self.reset()
+            return None
+        if self.out is None:
+            self.hand, self.out, self.last_t = pointer, pointer, at
+            return pointer
+        dt = max(at - self.last_t, 1e-3)
+        self.last_t = at
+        dx, dy = pointer[0] - self.hand[0], pointer[1] - self.hand[1]
+        self.hand = pointer
+        moved = math.hypot(dx, dy / ASPECT)               # TV widths this frame
+        speed = moved / dt
+        k = min(1.0, max(0.0, (speed - SPEED_SLOW) / (SPEED_FAST - SPEED_SLOW)))
+        k = k * k * (3 - 2 * k)                           # smooth change between the two gains
+        gain = GAIN_SLOW + (GAIN_FAST - GAIN_SLOW) * k
+        x, y = self.out[0] + dx * gain, self.out[1] + dy * gain
+        pull = min(1.0, CATCH_UP * moved)                 # back in line, only while moving
+        x += (pointer[0] - x) * pull
+        y += (pointer[1] - y) * pull
+        # The hand has reached an edge of the TV area: follow it all the way, so corners are always reachable.
+        snap = 1 - math.exp(-dt / EDGE_SNAP_S)
+        if pointer[0] <= 0.002 or pointer[0] >= 0.998:
+            x += (pointer[0] - x) * snap
+        if pointer[1] <= 0.002 or pointer[1] >= 0.998:
+            y += (pointer[1] - y) * snap
+        self.out = (clamp01(x), clamp01(y))
+        return self.out
+
+
+class StillLock:
+    """When the hand is (nearly) still, the pointer does not move at all.
+
+    A held hand is never perfectly still: it trembles, and the camera adds noise. Smoothing alone
+    leaves a slow drift, so the pointer "does not stop". Here, once the hand has been slower than
+    STILL_SPEED for STILL_TIME_S, the pointer locks exactly in place, and only unlocks when the hand
+    has clearly moved UNLOCK_DIST away. It then joins the hand smoothly, without a jump."""
+
+    def __init__(self):
+        self.reset()
+
+    def reset(self):
+        self.prev = None
+        self.last_t = None
+        self.slow_since = None
+        self.locked = None        # locked position, or None
+        self.offset = (0.0, 0.0)
+
+    def update(self, pointer, at: float):
+        if pointer is None:
+            self.reset()
+            return None
+        dt = 0.0 if self.last_t is None else max(1e-3, at - self.last_t)
+        speed = screen_dist(pointer, self.prev) / dt if self.prev is not None and dt > 0 else 0.0
+        self.prev, self.last_t = pointer, at
+        if self.locked is not None:
+            if screen_dist(pointer, self.locked) <= UNLOCK_DIST:
+                return self.locked
+            # Clearly moving again: start from the locked spot and join the hand.
+            self.offset = (self.locked[0] - pointer[0], self.locked[1] - pointer[1])
+            self.locked, self.slow_since = None, None
+        if speed < STILL_SPEED:
+            if self.slow_since is None:
+                self.slow_since = at
+        else:
+            self.slow_since = None
+        k = math.exp(-dt / UNLOCK_GLIDE_S_STILL) if dt > 0 else 1.0
+        self.offset = (self.offset[0] * k, self.offset[1] * k)
+        out = (clamp01(pointer[0] + self.offset[0]), clamp01(pointer[1] + self.offset[1]))
+        # Lock only once the pointer has caught up with the hand, so it never freezes beside it.
+        caught_up = math.hypot(self.offset[0], self.offset[1] / ASPECT) < 0.002
+        if self.slow_since is not None and at - self.slow_since >= STILL_TIME_S and caught_up:
+            self.locked, self.offset = out, (0.0, 0.0)
+        return out
+
+
 class PinchLock:
     """Keeps the pointer exactly where you pinched.
+
+    Strict: while a pinch is held and nothing is grabbed, the pointer does not move at all. While a
+    corner or side is grabbed, hand movement up to DRAG_DEADZONE is ignored (tremor), and beyond that
+    the pointer (and the grabbed handle) follows the hand smoothly from the spot where you pinched.
 
     Closing the thumb and finger moves the whole hand a little, and the pinch is only recognised
     once the fingers touch, so without this the pointer drifts off the spot you aimed at.
@@ -273,8 +404,9 @@ class PinchLock:
         self.shown = None
         self.last_t = None
 
-    def update(self, pointer, pinch, at: float):
-        """pointer: smoothed pointer or None. pinch: True / False, or None when unknown this frame."""
+    def update(self, pointer, pinch, at: float, dragging: bool = False):
+        """pointer: smoothed pointer or None. pinch: True / False, or None when unknown this frame.
+        dragging: a corner or side is grabbed (then the hand may move it)."""
         dt = 0.0 if self.last_t is None else max(0.0, at - self.last_t)
         self.last_t = at
         if pointer is None:
@@ -289,13 +421,16 @@ class PinchLock:
             before = [p for t, p in self.history if t <= at - LOCK_LOOKBACK_S]
             self.lock_point = before[-1] if before else (self.shown or pointer)
         if self.locked and pinch:
-            if at - self.lock_t < LOCK_SETTLE_S:
-                self.shown = self.lock_point
+            if at - self.lock_t < LOCK_SETTLE_S or not dragging:
+                self.shown = self.lock_point      # fixed: not a millimetre of movement
+                self.base = None
             else:
                 if self.base is None:
                     self.base = pointer
-                self.shown = (clamp01(self.lock_point[0] + pointer[0] - self.base[0]),
-                              clamp01(self.lock_point[1] + pointer[1] - self.base[1]))
+                dx, dy = pointer[0] - self.base[0], pointer[1] - self.base[1]
+                d = math.hypot(dx, dy / ASPECT)
+                f = 0.0 if d <= DRAG_DEADZONE else (d - DRAG_DEADZONE) / d   # ignore tremor, no jump at the edge
+                self.shown = (clamp01(self.lock_point[0] + dx * f), clamp01(self.lock_point[1] + dy * f))
             return self.shown
         if self.locked and not pinch:  # released: start from where the pointer was shown
             self.locked = False
@@ -393,17 +528,24 @@ class BoundaryEditor:
         return out
 
     def _find_hover(self, q, p):
-        scores = self._scores(q, p)
-        if self.hover is not None and self.hover != ("body",):  # stay on the current handle a bit longer
-            for t, sc in scores:
-                if t == self.hover and sc < HOVER_KEEP:
-                    return t
-        corners = [x for x in scores if x[0][0] == "corner" and x[1] < 1]
-        if corners:  # corners win over sides where they meet
-            return min(corners, key=lambda x: x[1])[0]
-        sides = [x for x in scores if x[0][0] == "edge" and x[1] < 1]
+        scores = dict(self._scores(q, p))
+        cur = self.hover
+
+        def keep(kind):  # stay on the current handle a bit longer (no flicker), within one kind
+            return cur is not None and cur[0] == kind and scores.get(cur, 9) < HOVER_KEEP
+
+        # A corner in reach always wins, even over a side that is highlighted (approaching a corner
+        # along a side used to keep the side selected, so the side was grabbed instead of the corner).
+        if keep("corner"):
+            return cur
+        corners = [(sc, t) for t, sc in scores.items() if t[0] == "corner" and sc < 1]
+        if corners:
+            return min(corners)[1]
+        if keep("edge"):
+            return cur
+        sides = [(sc, t) for t, sc in scores.items() if t[0] == "edge" and sc < 1]
         if sides:
-            return min(sides, key=lambda x: x[1])[0]
+            return min(sides)[1]
         return ("body",) if inside(q, p) else None
 
     # -- moving

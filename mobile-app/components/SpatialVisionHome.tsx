@@ -1,14 +1,16 @@
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import React, { useContext, useEffect, useMemo, useRef, useState } from 'react';
 import {
-  Animated, Easing, Platform, Pressable, ScrollView, StatusBar, StyleSheet, Text, TextInput, View, useColorScheme, useWindowDimensions,
+  Animated, BackHandler, Easing, Platform, Pressable, ScrollView, StatusBar, StyleSheet, Text, TextInput, View, useColorScheme, useWindowDimensions,
 } from 'react-native';
 import { MaterialCommunityIcons as Icon } from '@expo/vector-icons';
 import AsyncStorage from '@react-native-async-storage/async-storage';
+import * as NavBar from 'expo-navigation-bar';
 import AuthScreens, { AuthUser } from './AuthScreens';
+import { BrandEmblem, BrandLoader, BrandLogo } from './Brand';
 import ProjectionEditor from './ProjectionEditor';
 import { useProjectionScene } from './projection';
-import type { VisionStatus } from './ProjectionEditor';
+import type { PresetItem, VisionStatus } from './ProjectionEditor';
 
 // Keys for things the app remembers between launches.
 const KEY_SESSION = 'sv.session';
@@ -89,45 +91,12 @@ function makeStyles(T: Palette) {
     switchRow: { flexDirection: 'row', alignItems: 'center', gap: 12 },
     nav: { flexDirection: 'row', backgroundColor: T.s1, borderTopWidth: 1, borderColor: T.line, paddingTop: 8, paddingBottom: Platform.OS === 'android' ? 16 : 28 },
     navItem: { flex: 1, alignItems: 'center', gap: 2, minHeight: 52, justifyContent: 'center' },
-    splashName: { color: T.text, fontSize: 34, fontWeight: '800', letterSpacing: -0.8, marginTop: 14 },
-    splashSub: { color: T.cyan, fontSize: 15, fontWeight: '600', marginTop: 4 },
-    tag: { color: T.mute, fontSize: 12, marginTop: 8 },
-    placeholder: { position: 'absolute', bottom: 28, color: T.mute, fontSize: 10, opacity: 0.7 },
   });
 }
 type Styles = ReturnType<typeof makeStyles>;
 const ThemeCtx = React.createContext<{ T: Palette; s: Styles }>({ T: DARK, s: makeStyles(DARK) });
 const useTheme = () => useContext(ThemeCtx);
 
-/* ---------- Placeholder artwork: a faceted sculpture built from triangles ---------- */
-const Tri = ({ w, h, color, style }: { w: number; h: number; color: string; style?: object }) => (
-  <View style={[{ width: 0, height: 0, borderLeftWidth: w / 2, borderRightWidth: w / 2, borderBottomWidth: h,
-    borderLeftColor: 'transparent', borderRightColor: 'transparent', borderBottomColor: color }, style]} />
-);
-const FACETS: [number, number, number, number, string, number, number][] = [
-  [70, 80, 170, 190, '#2B4FD8', 0, 1], [115, 40, 110, 150, DARK.cyan, 0, 0.8], [40, 160, 120, 110, DARK.violet, 0, 0.9],
-  [150, 150, 120, 120, DARK.blue, 180, 0.85], [175, 95, 70, 90, DARK.pink, 0, 0.85], [110, 130, 90, 120, '#0E1430', 0, 0.7],
-  [20, 210, 90, 70, DARK.cyan, 0, 0.5],
-];
-const Sculpture = ({ scale = 1 }: { scale?: number }) => (
-  <View style={{ width: 300 * scale, height: 300 * scale, alignItems: 'center', justifyContent: 'center' }}>
-    <View style={{ width: 300, height: 300, transform: [{ scale }] }}>
-      <View style={{ position: 'absolute', left: 30, right: 30, bottom: 18, height: 30, borderRadius: 150, backgroundColor: DARK.cyan, opacity: 0.16 }} />
-      {FACETS.map(([l, t, w, h, c, r, o], i) => (
-        <Tri key={i} w={w} h={h} color={c} style={{ position: 'absolute', left: l, top: t, opacity: o, transform: [{ rotate: `${r}deg` }] }} />
-      ))}
-    </View>
-  </View>
-);
-const Logo = ({ size = 30 }: { size?: number }) => {
-  const { T } = useTheme();
-  return (
-    <View style={{ width: size, height: size, alignItems: 'center', justifyContent: 'center' }}>
-      <View style={{ width: size * 0.7, height: size * 0.7, borderWidth: 2, borderColor: T.cyan, borderRadius: 6, transform: [{ rotate: '45deg' }] }} />
-      <View style={{ position: 'absolute', width: size * 0.28, height: size * 0.28, backgroundColor: T.blue, borderRadius: 3, transform: [{ rotate: '45deg' }] }} />
-    </View>
-  );
-};
 const Pattern = ({ c, level }: { c: string[]; level: number }) => (
   <View style={{ flex: 1, flexDirection: 'row', flexWrap: 'wrap', opacity: 0.25 + level * 0.75 }}>
     {Array.from({ length: 24 }, (_, i) => (
@@ -162,35 +131,23 @@ const Stepper = ({ label, v, set }: { label: string; v: number; set: (n: number)
 };
 
 const Splash = ({ done }: { done: () => void }) => {
-  const { T, s } = useTheme();
-  const art = useRef(new Animated.Value(0)).current;
-  const br = useRef(new Animated.Value(0)).current;
+  const { T } = useTheme();
+  const { width } = useWindowDimensions();
+  const show = useRef(new Animated.Value(0)).current;
   const out = useRef(new Animated.Value(1)).current;
   useEffect(() => {
     Animated.sequence([
-      Animated.timing(art, { toValue: 1, duration: 700, useNativeDriver: true }),
-      Animated.timing(br, { toValue: 1, duration: 600, easing: Easing.out(Easing.cubic), useNativeDriver: true }),
-      Animated.delay(1300),
+      Animated.timing(show, { toValue: 1, duration: 700, easing: Easing.out(Easing.cubic), useNativeDriver: true }),
+      Animated.delay(1400),
       Animated.timing(out, { toValue: 0, duration: 500, useNativeDriver: true }),
     ]).start(() => done());
   }, []);
+  // The official logo for the current theme: light text in Dark Mode, dark text in Light Mode.
   return (
-    <Animated.View style={[StyleSheet.absoluteFill, { backgroundColor: T.bg, opacity: out, zIndex: 10, alignItems: 'center' }]}>
-      <Animated.View style={{ opacity: art, marginTop: TOP + 70 }}>
-        <View style={{ position: 'absolute', top: 40, left: 20, right: 20, height: 280, borderRadius: 140, backgroundColor: T.violet, opacity: T.dark ? 0.18 : 0.1 }} />
-        <Sculpture scale={1.15} />
+    <Animated.View style={[StyleSheet.absoluteFill, { backgroundColor: T.bg, opacity: out, zIndex: 10, alignItems: 'center', justifyContent: 'center' }]}>
+      <Animated.View style={{ opacity: show, transform: [{ scale: show.interpolate({ inputRange: [0, 1], outputRange: [0.94, 1] }) }] }}>
+        <BrandLogo dark={T.dark} width={Math.min(width - 64, 340)} />
       </Animated.View>
-      <View style={{ position: 'absolute', bottom: 0, left: 0, right: 0, height: 300, backgroundColor: T.dark ? 'rgba(8,11,22,0.6)' : 'rgba(244,246,252,0.6)' }} />
-      <Animated.View style={{ position: 'absolute', bottom: 90, alignItems: 'center', opacity: br, transform: [{ scale: br.interpolate({ inputRange: [0, 1], outputRange: [0.92, 1] }) }] }}>
-        <View style={{ width: 46, height: 46, alignItems: 'center', justifyContent: 'center' }}>
-          <View style={{ width: 32, height: 32, borderWidth: 2, borderColor: T.cyan, borderRadius: 6, transform: [{ rotate: '45deg' }] }} />
-          <View style={{ position: 'absolute', width: 13, height: 13, backgroundColor: T.blue, borderRadius: 3, transform: [{ rotate: '45deg' }] }} />
-        </View>
-        <Text style={s.splashName}>SpatialVision</Text>
-        <Text style={s.splashSub}>Intelligent Projection Mapping</Text>
-        <Text style={s.tag}>Transform surfaces. Create experiences.</Text>
-      </Animated.View>
-      <Text style={s.placeholder}>Placeholder artwork</Text>
     </Animated.View>
   );
 };
@@ -199,6 +156,31 @@ const Splash = ({ done }: { done: () => void }) => {
 export default function SpatialVisionHome() {
   const insets = useSafeAreaInsets();
   const { width } = useWindowDimensions();
+
+  // The Android navigation bar is hidden (App.tsx) and appears when the user swipes up from the bottom.
+  // The tab bar sits at the very bottom while it is hidden and slides up above it while it shows.
+  const [navShown, setNavShown] = useState(false);
+  const navLift = useRef(new Animated.Value(0)).current;
+  const NAV_BAR_FALLBACK = 48; // used only if Android reports no height for the bar while it shows
+  const navBarHeight = insets.bottom > 0 ? insets.bottom : NAV_BAR_FALLBACK;
+  useEffect(() => {
+    if (Platform.OS !== 'android') return;
+    let hideTimer: ReturnType<typeof setTimeout> | undefined;
+    const sub = NavBar.addVisibilityListener(({ visibility }) => {
+      const shown = visibility === 'visible';
+      setNavShown(shown);
+      clearTimeout(hideTimer);
+      // Hide the bar again after a few seconds if Android leaves it showing.
+      if (shown) hideTimer = setTimeout(() => { NavBar.setVisibilityAsync('hidden').catch(() => {}); }, 3000);
+    });
+    return () => { clearTimeout(hideTimer); sub.remove(); };
+  }, []);
+  useEffect(() => {
+    Animated.timing(navLift, {
+      toValue: Platform.OS === 'android' ? (navShown ? navBarHeight : 0) : insets.bottom,
+      duration: 220, easing: Easing.out(Easing.cubic), useNativeDriver: false,
+    }).start();
+  }, [navShown, navBarHeight]);
   const colW = width < 360 ? '100%' : '48%';
   // Follows the phone's light/dark setting unless the user picks one in Settings.
   const phone = useColorScheme();
@@ -212,8 +194,22 @@ export default function SpatialVisionHome() {
   const [loaded, setLoaded] = useState(false); // true once saved login and settings are read
   const [savedServer, setSavedServer] = useState('');
   const [route, setRouteRaw] = useState<Route>('home');
-  const [backTo, setBackTo] = useState<Route>('home');
-  const setRoute = (r: Route) => { setBackTo(route); setRouteRaw(r); };
+  // Pages visited, so the phone's back button (and the on-screen Back) go one step back at a time
+  // until Home; on Home, back closes the app as usual.
+  const [history, setHistory] = useState<Route[]>([]);
+  const setRoute = (r: Route) => {
+    if (r === route) return;
+    if (r === 'home') { setHistory([]); setRouteRaw('home'); return; } // Home starts fresh
+    setHistory((h) => [...h, route]);
+    setRouteRaw(r);
+  };
+  const goBack = (): boolean => {
+    if (route === 'home') return false; // let Android close the app
+    const prev = history.length ? history[history.length - 1] : 'home';
+    setHistory(history.slice(0, -1));
+    setRouteRaw(prev);
+    return true;
+  };
   const [preset, setPreset] = useState(0);
   const [bright, setBright] = useState(70), [inten, setInten] = useState(60), [speed, setSpeed] = useState(50);
   const [playing, setPlaying] = useState(true);
@@ -251,6 +247,14 @@ export default function SpatialVisionHome() {
 
   useEffect(() => () => { ws.current?.close(); }, []);
 
+  // Android's back button: one page back at a time. Read through a ref so it always sees the current page.
+  const backRef = useRef(goBack);
+  backRef.current = goBack;
+  useEffect(() => {
+    const sub = BackHandler.addEventListener('hardwareBackPress', () => backRef.current());
+    return () => sub.remove();
+  }, []);
+
   // On launch: restore theme, last server address and the saved login.
   useEffect(() => {
     (async () => {
@@ -263,10 +267,15 @@ export default function SpatialVisionHome() {
         const saved: AuthUser | null = raw ? JSON.parse(raw) : null;
         if (saved?.token && saved.server) {
           // Ask the backend if the saved login is still valid. If the PC is off, keep the user signed in.
+          // At most 4 s: if the PC is off or its address changed, Android could otherwise wait over a minute
+          // here with only a dark screen showing.
+          const ctrl = new AbortController();
+          const timer = setTimeout(() => ctrl.abort(), 4000);
           try {
-            const res = await fetch(`http://${saved.server}/auth/me`, { headers: { Authorization: `Bearer ${saved.token}` } });
-            if (res.status === 401) { await AsyncStorage.removeItem(KEY_SESSION); setLoaded(true); return; }
+            const res = await fetch(`http://${saved.server}/auth/me`, { headers: { Authorization: `Bearer ${saved.token}` }, signal: ctrl.signal });
+            if (res.status === 401) { clearTimeout(timer); await AsyncStorage.removeItem(KEY_SESSION); setLoaded(true); return; }
           } catch {}
+          clearTimeout(timer);
         }
         if (saved) setUser(saved);
       } catch {}
@@ -285,6 +294,7 @@ export default function SpatialVisionHome() {
 
   const login = (u: AuthUser) => {
     setUser(u);
+    setHistory([]);
     setRouteRaw('home');
     if (u.server) { setSavedServer(u.server); fillConnect(u.server); AsyncStorage.setItem(KEY_SERVER, u.server).catch(() => {}); }
     AsyncStorage.setItem(KEY_SESSION, JSON.stringify(u)).catch(() => {});
@@ -297,6 +307,7 @@ export default function SpatialVisionHome() {
     disconnect();
     await AsyncStorage.removeItem(KEY_SESSION).catch(() => {});
     setUser(null);
+    setHistory([]);
     setRouteRaw('home');
   };
 
@@ -331,8 +342,12 @@ export default function SpatialVisionHome() {
 
   const connected = conn === 'connected';
   const proj = useProjectionScene(send, connected);
+  const [presets, setPresets] = useState<PresetItem[]>([]);   // saved scenes on the PC
+  const [presetsMsg, setPresetsMsg] = useState('');
   onServerMessage.current = (m) => {
     if (m.type === 'scene') proj.applyRemote(m);
+    else if (m.type === 'presets') { setPresets(Array.isArray(m.items) ? m.items : []); setPresetsMsg(''); }
+    else if (m.type === 'presets_error') setPresetsMsg(String(m.message ?? 'Something went wrong with saved scenes.'));
     else if (m.type === 'vision_status') setVision({ running: !!m.running, source: m.source ?? null, fps: m.fps ?? null, detect_ms: m.detect_ms ?? null, latency_ms: m.latency_ms ?? null,
       gap_phone_ms: m.gap_phone_ms ?? null, gap_net_ms: m.gap_net_ms ?? null,
       held_pct: m.held_pct ?? null, held_why: m.held_why ?? null, error: m.error ?? null });
@@ -345,7 +360,7 @@ export default function SpatialVisionHome() {
   const Head = ({ t, sub }: { t: string; sub: string }) => (
     <View style={{ marginBottom: 16 }}>
       {route !== 'connect' && route !== 'studio' && route !== 'settings' && route !== 'home' ? (
-        <Pressable onPress={() => setRouteRaw(backTo === route ? 'home' : backTo)} style={s.back} accessibilityLabel="Back">
+        <Pressable onPress={goBack} style={s.back} accessibilityLabel="Back">
           <Icon name="chevron-left" size={22} color={T.cyan} /><Text style={{ color: T.cyan }}>Back</Text>
         </Pressable>
       ) : null}
@@ -358,12 +373,26 @@ export default function SpatialVisionHome() {
     <ThemeCtx.Provider value={{ T, s }}>
       <View style={s.root}>
         <StatusBar barStyle={isDark ? 'light-content' : 'dark-content'} />
+        {!loaded && !splash && (
+          <View style={[StyleSheet.absoluteFill, { alignItems: 'center', justifyContent: 'center' }]}>
+            <BrandLoader dark={isDark} label="Loading…" color={T.mute} />
+          </View>
+        )}
         {loaded && !user && <AuthScreens T={T} onDone={login} initialServer={savedServer} />}
-        {user && (<>
+        {user && route === 'calibration' && (
+          // The Projection Editor uses the whole screen (its own toolbars instead of the tab bar).
+          <Animated.View style={{ flex: 1, paddingBottom: navLift }}>
+            <ProjectionEditor T={T} proj={proj} connected={connected} tvConnected={tvConnected} server={`${ip.trim()}:${port}`} token={user?.token}
+              onBack={goBack} onGoConnect={() => setRoute('connect')}
+              vision={vision} lastGesture={lastGesture} onGestures={(on) => send(on ? { type: 'start_gestures', source: 'phone' } : { type: 'stop_gestures' })} send={send}
+              presets={presets} presetsMsg={presetsMsg} />
+          </Animated.View>
+        )}
+        {user && route !== 'calibration' && (<>
         <ScrollView contentContainerStyle={s.scroll} showsVerticalScrollIndicator={false} scrollEnabled={!dragging}>
           {route === 'home' && (<>
             <View style={s.topRow}>
-              <View style={s.brand}><Logo /><Text style={s.brandT}>SpatialVision</Text></View>
+              <View style={s.brand}><BrandEmblem dark={isDark} size={34} /><Text style={s.brandT}>SpatialVision</Text></View>
               <View style={s.topIcons}>
                 <Pressable onPress={() => setThemeMode(isDark ? 'light' : 'dark')} hitSlop={10} accessibilityRole="button" accessibilityLabel={isDark ? 'Switch to light mode' : 'Switch to dark mode'}>
                   <Icon name={isDark ? 'white-balance-sunny' : 'weather-night'} size={24} color={T.mute} />
@@ -374,7 +403,7 @@ export default function SpatialVisionHome() {
             <Text style={s.h1}>Your Spatial Studio</Text><Text style={s.mute}>Connect, calibrate, and create.</Text>
 
             <View style={s.feature}>
-              <View style={{ position: 'absolute', right: -50, top: -20 }}><Sculpture scale={0.85} /></View>
+              <View style={{ position: 'absolute', right: 14, top: 18, opacity: 0.9 }}><BrandEmblem dark size={150} /></View>
               <View style={[StyleSheet.absoluteFill, { backgroundColor: 'rgba(8,11,22,0.55)' }]} />
               <Text style={s.eyebrow}>PROJECTION STUDIO</Text>
               <Text style={s.fh}>Bring surfaces to life</Text>
@@ -431,6 +460,7 @@ export default function SpatialVisionHome() {
               <TextInput style={s.input} value={port} onChangeText={setPort} keyboardType="number-pad" placeholderTextColor={T.mute} />
               <Text style={s.label}>Pairing code</Text>
               <TextInput style={s.input} value={code} onChangeText={setCode} placeholder="4 digits" placeholderTextColor={T.mute} keyboardType="number-pad" maxLength={4} />
+              {conn === 'connecting' && <BrandLoader dark={isDark} size={56} label="Connecting to your PC…" color={T.mute} />}
               {conn === 'failed' && <Text style={s.error}>{err}</Text>}
               {conn === 'connected' && <Text style={[s.status, { color: T.cyan, marginLeft: 0, marginTop: 10 }]}>Paired with the backend.</Text>}
               <View style={{ marginTop: 14 }}>
@@ -460,14 +490,6 @@ export default function SpatialVisionHome() {
               <Btn label="Editor" ghost icon="vector-square" onPress={() => setRoute('calibration')} />
               <Btn label="Tracking" ghost icon="crosshairs-gps" onPress={() => setRoute('tracking')} />
             </View>
-          </>)}
-
-          {route === 'calibration' && (<>
-            <Head t="Projection Editor" sub="Drag the corners onto the surface. The TV updates live." />
-            <ProjectionEditor T={T} scene={proj.scene} update={proj.update} setCorners={proj.setCorners} sendLive={proj.sendLive} reset={proj.reset}
-              connected={connected} tvConnected={tvConnected} server={`${ip.trim()}:${port}`} token={user?.token}
-              onGoConnect={() => setRoute('connect')} onDragging={setDragging}
-              vision={vision} lastGesture={lastGesture} onGestures={(on) => send(on ? { type: 'start_gestures', source: 'phone' } : { type: 'stop_gestures' })} send={send} />
           </>)}
 
           {route === 'tracking' && (<>
@@ -542,7 +564,10 @@ export default function SpatialVisionHome() {
               </View>
             </View>
             <View style={s.card}>
-              <Text style={s.ct}>SpatialVision</Text><Text style={s.mute}>Version 1.0.0 (student prototype)</Text>
+              <View style={s.switchRow}>
+                <BrandEmblem dark={isDark} size={40} />
+                <View style={{ flex: 1 }}><Text style={s.ct}>SpatialVision</Text><Text style={s.mute}>Version 1.0.0 (student prototype)</Text></View>
+              </View>
               <Text style={[s.mute, { marginTop: 8 }]}>Target display: Haier Android TV. Projector output is coming soon.</Text>
             </View>
             <View style={s.card}>
@@ -552,14 +577,14 @@ export default function SpatialVisionHome() {
           </>)}
         </ScrollView>
 
-        <View style={[s.nav, { paddingBottom: 8 + insets.bottom }]}>
+        <Animated.View style={[s.nav, { paddingBottom: Animated.add(8, navLift) }]}>
           {NAV.map(([r, l, ic]) => (
             <Pressable key={r} style={s.navItem} onPress={() => setRoute(r)} accessibilityRole="button" accessibilityState={{ selected: tab === r }} accessibilityLabel={l}>
               <Icon name={ic} size={24} color={tab === r ? T.blue : T.mute} />
               <Text style={{ fontSize: 11, color: tab === r ? T.blue : T.mute, fontWeight: tab === r ? '700' : '500' }}>{l}</Text>
             </Pressable>
           ))}
-        </View>
+        </Animated.View>
         </>)}
         {splash && <Splash done={() => setSplash(false)} />}
       </View>

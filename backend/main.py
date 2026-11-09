@@ -1,7 +1,9 @@
 import asyncio
 import base64
 import binascii
+import json
 import secrets
+import time
 from pathlib import Path
 
 from fastapi import FastAPI, Header, HTTPException, WebSocket, WebSocketDisconnect
@@ -9,13 +11,17 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
+import presets
 from auth import router as auth_router, user_from_token
+from scene_model import apply_changes, normalize
 from vision.gesture_service import GestureService
 
 BASE = Path(__file__).parent
 TV_DIR = BASE.parent / "tv-display"   # the TV web page
 ASSETS_DIR = BASE / "assets"           # images uploaded from the phone (ignored by git)
 ASSETS_DIR.mkdir(exist_ok=True)
+SCENE_FILE = BASE / "scene.json"       # the last shape and content, kept across restarts (ignored by git)
+SCENE_SAVE_S = 0.5                     # while something is being dragged, save at most twice a second
 MAX_UPLOAD_BYTES = 15 * 1024 * 1024
 IMAGE_TYPES = {"image/jpeg": ".jpg", "image/png": ".png", "image/webp": ".webp"}
 
@@ -24,6 +30,15 @@ app = FastAPI(title="SpatialVision Backend")
 # Lets the Expo web version (running in a browser) call this server.
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 app.include_router(auth_router)
+
+
+def load_scene() -> dict:
+    """The scene saved last time, or the default one. Anything broken in the file is ignored.
+    A scene.json from before surfaces existed becomes surface 1."""
+    try:
+        return normalize(json.loads(SCENE_FILE.read_text()))
+    except (OSError, ValueError, AttributeError, TypeError):
+        return normalize({})
 
 
 def new_code() -> str:
@@ -38,9 +53,32 @@ class Hub:
         self.tv: WebSocket | None = None
         self.phones: set[WebSocket] = set()
         # The current scene (corners, content). Changed by the phone or by gestures.
-        # A TV that reconnects gets it straight away.
-        self.scene: dict = {"type": "scene", "corners": [[0.1, 0.1], [0.9, 0.1], [0.9, 0.9], [0.1, 0.9]],
-                            "content": "pattern", "fit": "contain", "grid": False, "image_url": None}
+        # A TV or phone that connects gets it straight away. It is saved to scene.json, so a restart
+        # of the backend keeps the shape where it was left.
+        self.scene: dict = load_scene()
+        self._saved_at = 0.0
+        self._save_pending = False
+
+    def remember(self):
+        """Saves the scene soon (at most every SCENE_SAVE_S while it keeps changing)."""
+        if self._save_pending:
+            return
+        wait = SCENE_SAVE_S - (time.monotonic() - self._saved_at)
+        if wait <= 0:
+            self._save_now()
+        else:
+            self._save_pending = True
+            asyncio.get_running_loop().call_later(wait, self._save_now)
+
+    def _save_now(self):
+        self._save_pending = False
+        self._saved_at = time.monotonic()
+        try:
+            tmp = SCENE_FILE.with_suffix(".tmp")
+            tmp.write_text(json.dumps(self.scene))
+            tmp.replace(SCENE_FILE)  # replace in one step, so a crash never leaves half a file
+        except OSError as e:
+            print(f"Could not save the scene: {e}")
 
     async def to_phones(self, message: dict):
         for ws in list(self.phones):
@@ -61,7 +99,8 @@ class Hub:
 
     async def update_scene(self, changes: dict, phones: bool = True):
         """Used by gestures: changes part of the scene and tells the TV (and the phones, unless phones=False)."""
-        self.scene = {**self.scene, **changes}
+        self.scene = apply_changes(self.scene, changes)
+        self.remember()
         await self.to_tv(self.scene)
         if phones:
             await self.to_phones(self.scene)
@@ -75,6 +114,13 @@ gesture_phone = {"ws": None}  # the phone whose camera is the gesture source
 @app.on_event("shutdown")
 def stop_gestures():
     gestures.stop()
+
+
+@app.on_event("shutdown")
+def save_scene_on_exit():
+    """A save that was still waiting (during a drag) is written before the backend stops."""
+    if hub._save_pending:
+        hub._save_now()
 
 
 @app.get("/health")
@@ -115,6 +161,7 @@ async def phone_socket(ws: WebSocket, code: str = ""):
         return
     hub.phones.add(ws)
     await ws.send_json({"type": "paired", "tv_connected": hub.tv is not None})
+    await ws.send_json(hub.scene)  # the shape as it is now, so the phone starts from it instead of overwriting it
     await ws.send_json(gestures.status)
     await hub.phones_changed()
     try:
@@ -135,7 +182,13 @@ async def phone_socket(ws: WebSocket, code: str = ""):
                 gestures.stop()
                 continue
             if kind == "scene":
-                hub.scene = {**hub.scene, **data}
+                hub.scene = normalize(data, hub.scene)
+                hub.remember()
+                await hub.to_tv(hub.scene)
+                continue
+            if kind in ("list_presets", "save_preset", "load_preset", "delete_preset"):
+                await handle_presets(ws, kind, data)
+                continue
             await hub.to_tv(data)
     except WebSocketDisconnect:
         pass
@@ -145,6 +198,28 @@ async def phone_socket(ws: WebSocket, code: str = ""):
             gesture_phone["ws"] = None
             gestures.phone_gone()
         await hub.phones_changed()
+
+
+async def handle_presets(ws: WebSocket, kind: str, data: dict):
+    """Saved scenes: the phone asks, the backend answers with the list (and loads one when asked)."""
+    try:
+        pid = int(data.get("id", -1))
+    except (TypeError, ValueError):
+        pid = -1
+    if kind == "save_preset":
+        presets.save_preset(str(data.get("name", "")), hub.scene)
+    elif kind == "delete_preset":
+        presets.delete_preset(pid)
+    elif kind == "load_preset":
+        scene = presets.load_preset(pid)
+        if scene is None:
+            await ws.send_json({"type": "presets_error", "message": "That saved scene no longer exists."})
+        else:
+            hub.scene = scene
+            hub.remember()
+            await hub.to_tv(hub.scene)
+            await hub.to_phones(hub.scene)
+    await ws.send_json({"type": "presets", "items": presets.list_presets()})
 
 
 class UploadIn(BaseModel):

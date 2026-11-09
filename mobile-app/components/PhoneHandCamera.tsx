@@ -1,5 +1,7 @@
-import React, { memo, useEffect, useRef, useState } from 'react';
+import React, { memo, useEffect, useMemo, useRef, useState } from 'react';
 import { PermissionsAndroid, Platform, Pressable, StyleSheet, Text, View } from 'react-native';
+import AsyncStorage from '@react-native-async-storage/async-storage';
+import { BrandLoader } from './Brand';
 
 /**
  * Uses THIS PHONE's front camera for hand tracking. MediaPipe runs on the phone (expo-mediapipe),
@@ -16,63 +18,84 @@ try { MP = require('expo-mediapipe'); } catch { MP = null; }
 let useKeepAwake: (() => void) | null = null;
 try { useKeepAwake = require('expo-keep-awake').useKeepAwake; } catch { useKeepAwake = null; }
 
-export const phoneCameraAvailable = Platform.OS === 'android' && !!MP && typeof MP.useMediaPipe === 'function';
+export const phoneCameraAvailable = Platform.OS === 'android' && !!MP && !!MP.NativeCameraView;
 
 type Theme = { text: string; mute: string; cyan: string; err: string; line: string; s2: string; blue: string };
 type Props = { T: Theme; send: (msg: object) => boolean };
 
 const ROTATIONS = [0, 90, 180, 270];
+const KEY_DELEGATE = 'sv.handTrackerProcessor';
 const r4 = (v: number) => Math.round(v * 10000) / 10000;
 
 /** Keeps the screen on while the phone is the camera (it sits on a stand, nobody touches it). */
 function KeepAwake() { useKeepAwake?.(); return null; }
 
-/** The camera itself. Only mounted when the native module exists and permission is granted. */
-const Tracker = memo(function Tracker({ T, send, mirror, rot, onError }: Props & { mirror: boolean; rot: number; onError: (m: string) => void }) {
-  // The hook may keep the first callbacks it is given, so everything they use is read through refs.
+/** The camera itself. Only mounted when the native module exists and permission is granted.
+ *
+ * Uses the package's camera view directly instead of its useMediaPipe hook: the hook stores every
+ * result in React state, which re-rendered this component 15-30 times a second on the phone's main
+ * JavaScript thread, the same thread that sends the hand points. Measured 9 Nov: the phone delivered
+ * only ~15 frames a second with pauses up to 560 ms. Here a result is read from the flat number list
+ * the native side sends and goes straight to the WebSocket; React only updates once a second. */
+const Tracker = memo(function Tracker({ T, send, mirror, rot, delegate, onError }: Props & { mirror: boolean; rot: number; delegate: 'gpu' | 'cpu'; onError: (m: string) => void }) {
   const sendRef = useRef(send); sendRef.current = send;
   const cfg = useRef({ mirror, rot }); cfg.current = { mirror, rot };
   const errRef = useRef(onError); errRef.current = onError;
+  const count = useRef(0);
   const [fps, setFps] = useState<number | null>(null);
+  const [status, setStatus] = useState('loading');
 
-  const { status, startCamera, stopCamera, CameraView } = MP.useMediaPipe({
-    task: 'handLandmarker',
-    modelPath: 'hand_landmarker.task',
-    maxResults: 1,
-    minConfidence: 0.5,
-    cameraFacing: 'front',
-    delegate: 'gpu',
-    onResults: (r: any) => {
-      const hand = r?.landmarks?.[0];
-      const flat = Array.isArray(hand) && hand.length === 21
-        ? hand.flatMap((p: any) => [r4(Number(p.x)), r4(Number(p.y))])
-        : null;
+  // Once a second: frames per second, measured on the phone.
+  useEffect(() => {
+    let last = Date.now();
+    const id = setInterval(() => {
+      const now = Date.now();
+      setFps(Math.round((count.current * 1000) / Math.max(1, now - last)));
+      count.current = 0; last = now;
+    }, 1000);
+    return () => clearInterval(id);
+  }, []);
+
+  // Stable handlers (created once), so the native camera view is never re-mounted.
+  const handlers = useMemo(() => ({
+    onResults: (e: any) => {
+      const r = e?.nativeEvent ?? {};
+      count.current++;
+      let flat: number[] | null = null;
+      if (Array.isArray(r.landmarksFlat) && (r.landmarksPerEntity ?? 21) === 21 && r.landmarksFlat.length >= 21 * (r.landmarksStride ?? 3)) {
+        const st = r.landmarksStride ?? 3;
+        flat = new Array(42);
+        for (let i = 0; i < 21; i++) { flat[2 * i] = r4(r.landmarksFlat[i * st]); flat[2 * i + 1] = r4(r.landmarksFlat[i * st + 1]); }
+      } else if (Array.isArray(r.landmarks?.[0]) && r.landmarks[0].length === 21) {
+        flat = r.landmarks[0].flatMap((p: any) => [r4(Number(p.x)), r4(Number(p.y))]);
+      }
       sendRef.current({
         type: 'hand', pts: flat, t: Date.now(), // phone's time of this frame, so Wi-Fi bursts do not jerk the pointer
-        w: r?.imageWidth ?? 0, h: r?.imageHeight ?? 0,
+        w: r.imageWidth ?? 0, h: r.imageHeight ?? 0,
         mirror: cfg.current.mirror, rot: cfg.current.rot,
       });
     },
-    onPerformance: (p: any) => { if (typeof p?.fps === 'number') setFps(Math.round(p.fps)); },
-    onError: (e: any) => errRef.current(String(e?.message ?? e?.error ?? e ?? 'Camera error')),
-  });
+    onError: (e: any) => { setStatus('error'); errRef.current(String(e?.nativeEvent?.message ?? 'Camera error')); },
+    onStatusChange: (e: any) => setStatus(String(e?.nativeEvent?.status ?? 'ready')),
+  }), []);
 
-  useEffect(() => {
-    if (status === 'ready') {
-      Promise.resolve(startCamera?.()).catch((e: any) => errRef.current(String(e?.message ?? e)));
-    }
-  }, [status]);
-  useEffect(() => () => { try { stopCamera?.(); } catch {} }, []);
-
+  const Camera = MP.NativeCameraView;
   return (
     <View>
       <View style={[styles.preview, { borderColor: T.line }]}>
-        {CameraView ? <CameraView style={StyleSheet.absoluteFill} /> : null}
+        <Camera key={delegate} style={StyleSheet.absoluteFill} task="handLandmarker" modelPath="hand_landmarker.task"
+          maxResults={1} minConfidence={0.4} cameraFacing="front" delegate={delegate}
+          isCameraRunning inferenceEnabled streamId={0}
+          onResults={handlers.onResults} onError={handlers.onError} onStatusChange={handlers.onStatusChange} />
+        {!fps && status !== 'error' && (
+          <View style={[StyleSheet.absoluteFill, { alignItems: 'center', justifyContent: 'center' }]} pointerEvents="none">
+            <BrandLoader dark size={52} label="Starting the hand tracker…" />
+          </View>
+        )}
       </View>
       <Text style={[styles.small, { color: T.mute }]}>
         {status === 'error' ? 'The hand tracker could not start.'
-          : status !== 'ready' ? 'Loading the hand tracker…'
-          : fps == null ? 'Camera starting…' : `Phone camera: ${fps} fps (measured on the phone)`}
+          : !fps ? 'Starting the hand tracker…' : `Phone camera: ${fps} frames per second (measured on the phone)`}
       </Text>
     </View>
   );
@@ -82,6 +105,15 @@ export default function PhoneHandCamera({ T, send }: Props) {
   const [perm, setPerm] = useState<'asking' | 'granted' | 'denied'>('asking');
   const [mirror, setMirror] = useState(true); // front camera: mirror so moving right moves right
   const [rot, setRot] = useState(0);
+  // Which part of the phone runs the hand tracking. The graphics chip (GPU) is usually faster, but on
+  // some older phones the main processor (CPU) is. Compare the frames-per-second number; the choice is kept.
+  const [delegate, setDelegate] = useState<'gpu' | 'cpu'>('gpu');
+  useEffect(() => { AsyncStorage.getItem(KEY_DELEGATE).then((v) => { if (v === 'cpu' || v === 'gpu') setDelegate(v); }).catch(() => {}); }, []);
+  const switchDelegate = () => setDelegate((d) => {
+    const next = d === 'gpu' ? 'cpu' : 'gpu';
+    AsyncStorage.setItem(KEY_DELEGATE, next).catch(() => {});
+    return next;
+  });
   const [error, setError] = useState('');
 
   useEffect(() => {
@@ -115,7 +147,7 @@ export default function PhoneHandCamera({ T, send }: Props) {
   return (
     <View style={{ marginTop: 12 }}>
       <KeepAwake />
-      <Tracker T={T} send={send} mirror={mirror} rot={rot} onError={setError} />
+      <Tracker T={T} send={send} mirror={mirror} rot={rot} delegate={delegate} onError={setError} />
       <View style={styles.row}>
         <Pressable onPress={() => setMirror((m) => !m)} accessibilityRole="button" accessibilityLabel="Mirror left and right">
           <Text style={[styles.chip, { color: mirror ? '#FFFFFF' : T.mute, backgroundColor: mirror ? T.blue : 'transparent', borderColor: mirror ? T.blue : T.line }]}>Mirror</Text>
@@ -123,9 +155,12 @@ export default function PhoneHandCamera({ T, send }: Props) {
         <Pressable onPress={() => setRot((r) => ROTATIONS[(ROTATIONS.indexOf(r) + 1) % 4])} accessibilityRole="button" accessibilityLabel="Turn the camera picture">
           <Text style={[styles.chip, { color: T.mute, borderColor: T.line }]}>Turn {rot}°</Text>
         </Pressable>
+        <Pressable onPress={switchDelegate} accessibilityRole="button" accessibilityLabel={`Hand tracking runs on the ${delegate === 'gpu' ? 'graphics chip' : 'main processor'}. Tap to switch`}>
+          <Text style={[styles.chip, { color: T.mute, borderColor: T.line }]}>Runs on {delegate === 'gpu' ? 'GPU' : 'CPU'}</Text>
+        </Pressable>
       </View>
       <Text style={[styles.small, { color: T.mute }]}>
-        Put the phone on a stand facing you. If the pointer moves the wrong way, tap Mirror; if up and down are swapped, tap Turn.
+        Put the phone on a stand facing you, about an arm's length away, so your hand is clearly visible. If the pointer moves the wrong way, tap Mirror; if up and down are swapped, tap Turn. If it feels slow, tap GPU/CPU and keep whichever shows more frames per second.
       </Text>
       {error ? <Text style={[styles.small, { color: T.err }]}>{error}</Text> : null}
     </View>
@@ -135,6 +170,6 @@ export default function PhoneHandCamera({ T, send }: Props) {
 const styles = StyleSheet.create({
   preview: { height: 180, borderRadius: 14, borderWidth: 1, overflow: 'hidden', backgroundColor: '#000' },
   small: { fontSize: 12, lineHeight: 17, marginTop: 8 },
-  row: { flexDirection: 'row', gap: 8, marginTop: 10 },
+  row: { flexDirection: 'row', flexWrap: 'wrap', gap: 8, marginTop: 10 },
   chip: { borderWidth: 1, borderRadius: 18, paddingVertical: 8, paddingHorizontal: 14, overflow: 'hidden', fontSize: 13 },
 });

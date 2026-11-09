@@ -28,6 +28,8 @@ async def main():
         # 3. A phone with the RIGHT code is paired, and the TV is told
         async with websockets.connect(f"{URL}/ws/phone?code={code}") as phone:
             print("Phone got     :", await recv(phone, "paired"))
+            before = await recv(phone, "scene")  # the phone is sent the current shape right after pairing
+            print("Phone got     : the current shape", before["corners"])
             print("TV got        :", await recv(tv, "phones"))
 
             # 4. Phone -> TV: a scene with four corners
@@ -38,6 +40,10 @@ async def main():
             # 5. TV -> Phone
             await tv.send(json.dumps({"type": "calibration_done", "error_px": 0.8}))
             print("Phone received:", await recv(phone, "calibration_done"))
+
+            # 6. Put your real shape back (the backend saves the shape, so the test must not change it)
+            await phone.send(json.dumps(before))
+            await recv(tv, "scene")
 
     print("\nAll checks passed.")
 
