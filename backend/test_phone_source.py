@@ -8,6 +8,7 @@ phone does, grabs corner 1 with a pinch, drags it, lets go, and pauses. It also 
 PC webcam is never opened in phone mode.
 """
 import asyncio
+import statistics
 import time
 
 import vision.camera
@@ -54,11 +55,16 @@ class Hub:
     async def update_scene(self, changes, phones=True):
         self.scene = {**self.scene, **changes}
         self.tv.append(dict(self.scene))
+        if phones:
+            self.phones.append(dict(self.scene))
 
 
-def message(pts, mirror=False, rot=0):
+def message(pts, mirror=False, rot=0, t=None):
     flat = None if pts is None else [round(c, 4) for p in pts for c in p]
-    return {"type": "hand", "pts": flat, "w": 1280, "h": 720, "mirror": mirror, "rot": rot, "detect_ms": 18.0}
+    m = {"type": "hand", "pts": flat, "w": 1280, "h": 720, "mirror": mirror, "rot": rot, "detect_ms": 18.0}
+    if t is not None:
+        m["t"] = t
+    return m
 
 
 async def main():
@@ -93,6 +99,8 @@ async def main():
     check("pinch-drag moves corner 1 and releases", abs(c1[0] - 0.2) < 0.02 and abs(c1[1] - 0.2) < 0.02 and svc.engine.editor.drag is None,
           f"corner 1 now {c1[0]:.3f}, {c1[1]:.3f}")
     check("other corners unchanged", hub.scene["corners"][1:] == [[0.9, 0.1], [0.9, 0.9], [0.1, 0.9]])
+    scene_to_phone = [m for m in hub.phones if m.get("type") == "scene"]
+    check("phone gets the shape once, at release (not during the drag)", len(scene_to_phone) == 1, f"{len(scene_to_phone)} update(s)")
 
     # Phone stops sending for 0.4 s: pointer is held (dimmed), not hidden.
     hub.tv.clear()
@@ -114,6 +122,27 @@ async def main():
     await send(hand(0.5, 0.45, noise=0.002), 40)
     status = [m for m in hub.phones if m.get("type") == "vision_status" and m.get("fps")]
     check("measured rate reported", bool(status), f"{status[-1]['fps']} messages/s, phone detection {status[-1]['detect_ms']} ms" if status else "")
+
+    # Wi-Fi bursts: the phone takes a frame every 33 ms while the hand moves steadily, but the
+    # messages arrive 4 at a time every 133 ms. With the phone's time stamps the pointer still moves evenly.
+    async def burst_run(stamped):
+        svc.stop(); await asyncio.sleep(0.1)
+        svc.start(asyncio.get_running_loop()); await asyncio.sleep(0.05)
+        await send(hand(0.4, 0.45, noise=0.0), 45)  # learn the hand
+        t_ms, x, xs = 100000.0, 0.4, []
+        for burst in range(12):
+            for k in range(4):
+                x += 0.004
+                t_ms += 1000 / 30
+                svc.on_phone_hand(message(hand(x, 0.45), t=t_ms if stamped else None))
+                xs.append(svc.engine.pointer_tracker.pointer[0])  # where the pointer is after each frame
+            await asyncio.sleep(4 / 30)
+        steps = [b - a for a, b in zip(xs[8:], xs[9:])]
+        return statistics.pstdev(steps) / max(statistics.mean(steps), 1e-9)
+
+    unstamped, stamped = await burst_run(False), await burst_run(True)
+    check("Wi-Fi bursts: pointer moves evenly with phone time stamps", stamped < unstamped * 0.5,
+          f"unevenness {unstamped:.2f} by arrival time, {stamped:.2f} with phone time")
 
     svc.stop()
     await asyncio.sleep(0.1)

@@ -8,7 +8,8 @@ import PhoneHandCamera, { phoneCameraAvailable } from './PhoneHandCamera';
 
 type Theme = { dark: boolean; bg: string; s1: string; s2: string; blue: string; cyan: string; violet: string; text: string; mute: string; line: string; err: string };
 type Ic = React.ComponentProps<typeof Icon>['name'];
-export type VisionStatus = { running: boolean; source?: string | null; fps: number | null; detect_ms: number | null; latency_ms?: number | null; error: string | null };
+export type VisionStatus = { running: boolean; source?: string | null; fps: number | null; detect_ms: number | null; latency_ms?: number | null;
+  gap_phone_ms?: number | null; gap_net_ms?: number | null; held_pct?: number | null; held_why?: string | null; error: string | null };
 
 const GESTURE_NAMES: Record<string, string> = {
   pinch: 'Pinch', point: 'Point', open_palm: 'Open palm', fist: 'Fist', swipe_left: 'Swipe left', swipe_right: 'Swipe right',
@@ -317,6 +318,9 @@ export default function ProjectionEditor(p: Props) {
             {p.vision.fps == null ? 'Starting the camera…'
               : p.vision.source === 'phone'
                 ? `Measured on the PC: ${p.vision.fps} hand updates per second from this phone${p.vision.latency_ms != null ? `, PC to TV ${p.vision.latency_ms} ms` : ''}`
+                  + (p.vision.gap_phone_ms != null || p.vision.gap_net_ms != null
+                    ? `. Longest pause in the last second: phone ${p.vision.gap_phone_ms ?? '-'} ms, Wi-Fi ${p.vision.gap_net_ms ?? '-'} ms` : '')
+                  + (p.vision.held_pct ? `. Pointer held ${p.vision.held_pct}% (${p.vision.held_why ?? 'unclear hand'})` : '')
                 : `Measured: ${p.vision.fps} fps, hand detection ${p.vision.detect_ms} ms per frame${p.vision.latency_ms != null ? `, delay to TV ${p.vision.latency_ms} ms` : ''}`}
           </Text>
         ) : (
@@ -328,7 +332,7 @@ export default function ProjectionEditor(p: Props) {
         )}
         <View style={{ marginTop: 10, gap: 4 }}>
           <Text style={s.hint}>✋  Move your whole hand to move the pointer on the TV</Text>
-          <Text style={s.hint}>🤏  Pinch on a corner to drag it, inside the shape to move it all, on a side to resize</Text>
+          <Text style={s.hint}>🤏  Pinch a corner to move that corner, a side to move only that side, inside to move it all</Text>
           <Text style={s.hint}>🖐️  Swipe an open hand left or right to change the content</Text>
         </View>
         <Pressable style={[s.btn, { marginTop: 12 }, p.vision.running && s.ghostSolo, (!p.connected || (!phoneCameraAvailable && !p.vision.running)) && { opacity: 0.45 }]}

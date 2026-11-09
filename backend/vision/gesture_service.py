@@ -18,13 +18,14 @@ import math
 import statistics
 import threading
 import time
-from collections import deque, namedtuple
+from collections import Counter, deque, namedtuple
 
 from vision.hands import INDEX_TIP, GestureTracker, classify
-from vision.interaction import PHONE_UPDATE_S, BoundaryEditor, PointerTracker, target_name
+from vision.interaction import PHONE_UPDATE_S, BoundaryEditor, PinchLock, PointerTracker, target_name
 
 CONTENT_ORDER = ["pattern", "image", "blank"]
-PHONE_GAP_S = 0.15        # no hand message from the phone for this long: treat as "no hand" this frame
+PHONE_GAP_S = 0.35        # no hand message from the phone for this long: treat as "no hand" (short Wi-Fi pauses are normal)
+CLOCK_WINDOW_S = 5.0      # phone-to-PC clock offset: the quickest delivery seen in this window
 PHONE_SILENT_S = 3.0      # ...for this long: tell the phone user the camera stopped sending
 Point = namedtuple("Point", "x y")
 
@@ -33,6 +34,19 @@ def next_content(current: str, has_image: bool, step: int) -> str:
     options = [c for c in CONTENT_ORDER if c != "image" or has_image]
     i = options.index(current) if current in options else 0
     return options[(i + step) % len(options)]
+
+
+def held_report(engine) -> dict:
+    """Share of frames in the last second where the pointer was held still (hand unclear), and the
+    main reason. Resets the counts. Shown in the app so problem areas can be measured, not guessed."""
+    if engine is None:
+        return {"held_pct": None, "held_why": None}
+    total = sum(engine.frames.values())
+    held = engine.frames["holding"]
+    why = engine.reasons.most_common(1)[0][0] if engine.reasons else None
+    engine.frames.clear()
+    engine.reasons.clear()
+    return {"held_pct": round(100 * held / total) if total else None, "held_why": why}
 
 
 def phone_points(msg: dict):
@@ -76,6 +90,9 @@ class GestureEngine:
         self.tracker = GestureTracker()
         self.pointer_tracker = PointerTracker()
         self.editor = BoundaryEditor()
+        self.lock = PinchLock()
+        self.frames = Counter()   # frames per state since the last status report (tracking / holding / lost)
+        self.reasons = Counter()  # ...and why the pointer was held
         self.pinching = False           # pinch state with hysteresis (see classify)
         self.last_phone_update = 0.0
         self.start = time.perf_counter()
@@ -89,6 +106,9 @@ class GestureEngine:
             raw = classify([Point(x, y) for x, y in pts], was_pinching=self.pinching)
         pointer, state = self.pointer_tracker.update(pts, frame_w, frame_h, at,
                                                      freeze_area=self.pinching or self.editor.drag is not None)
+        self.frames[state] += 1
+        if state == "holding":
+            self.reasons[self.pointer_tracker.reason or "?"] += 1
         # The pinch only counts while the hand is clearly seen; otherwise it is "unknown",
         # so a short tracking gap never drops or grabs a corner by accident.
         if state == "tracking":
@@ -97,14 +117,21 @@ class GestureEngine:
         else:
             pinch = None
 
+        pointer = self.lock.update(pointer, pinch, at)  # keep the pointer where the pinch started
+
         event = self.tracker.update(raw, pts[INDEX_TIP][0] if pts else None, at)
         gesture = self.tracker.stable
 
         # Editing the shape: hover, grab, drag, release.
         corners, released = self.editor.update(pointer, pinch, hub.scene["corners"], at)
         if corners is not None:
-            # The TV follows every frame; the phone only needs a few updates while dragging.
-            to_phone = released or at - self.last_phone_update >= PHONE_UPDATE_S
+            # The TV follows every frame. When the phone is the camera, it gets the new shape only
+            # once, when the corner is dropped: redrawing its screen during the drag would slow down
+            # the hand points it is sending (that was the lag while pinching). Otherwise a few updates.
+            if svc.source == "phone":
+                to_phone = released
+            else:
+                to_phone = released or at - self.last_phone_update >= PHONE_UPDATE_S
             if to_phone:
                 self.last_phone_update = at
             svc._change_scene(phones=to_phone, corners=corners)
@@ -137,6 +164,11 @@ class GestureService:
         self.phone_task: asyncio.Task | None = None
         self.phone_last_at = 0.0             # when the last hand message from the phone arrived
         self.phone_count = 0                 # messages since the last status report
+        self.clock = deque()                 # (arrival time, arrival - phone time) for the clock offset
+        self.last_frame_at = 0.0             # phone frame time (in PC clock) of the last message
+        self.last_phone_t = None             # phone's own time of the last message (seconds)
+        self.gap_phone = 0.0                 # longest pause between frames on the phone (this second)
+        self.gap_net = 0.0                   # longest pause between arrivals at the PC (this second)
         self.phone_detect_ms: float | None = None
         # Delay from reading a camera frame to the TV page drawing the pointer and answering (milliseconds).
         self.latencies: deque[float] = deque(maxlen=60)
@@ -178,6 +210,9 @@ class GestureService:
         else:
             self.phone_last_at = time.perf_counter()
             self.phone_count = 0
+            self.clock.clear()
+            self.last_frame_at, self.last_phone_t = 0.0, None
+            self.gap_phone = self.gap_net = 0.0
             self.phone_detect_ms = None
             self.phone_task = loop.create_task(self._phone_watchdog())
             self._publish_status(running=True, source="phone", error=None, fps=None, detect_ms=None, latency_ms=None)
@@ -189,14 +224,39 @@ class GestureService:
 
     # ---------- phone camera source ----------
     def on_phone_hand(self, msg: dict):
-        """A "hand" message from the app: the hand points the phone's camera saw in one frame."""
+        """A "hand" message from the app: the hand points the phone's camera saw in one frame.
+
+        Wi-Fi often delivers messages in small bursts. Timing them by arrival would make a burst look
+        like a sudden fast movement (and a pause like a stop), so the phone stamps each frame with its
+        own clock ("t", milliseconds) and the backend converts that to PC time. The offset between the
+        clocks is taken from the quickest delivery seen recently."""
         if self.source != "phone" or not self.running or self.engine is None:
             return
-        at = time.perf_counter()
-        self.phone_last_at = at
+        arrival = time.perf_counter()
+        self.gap_net = max(self.gap_net, arrival - self.phone_last_at) if self.phone_count else self.gap_net
+        self.phone_last_at = arrival
         self.phone_count += 1
         if isinstance(msg.get("detect_ms"), (int, float)):
             self.phone_detect_ms = round(float(msg["detect_ms"]), 1)
+
+        at = arrival
+        t = msg.get("t")
+        if isinstance(t, (int, float)) and math.isfinite(t):
+            phone_t = float(t) / 1000.0
+            if self.last_phone_t is not None:
+                if phone_t < self.last_phone_t - 1.0:  # phone clock jumped back (app restarted): start again
+                    self.clock.clear()
+                else:
+                    self.gap_phone = max(self.gap_phone, phone_t - self.last_phone_t)
+            self.last_phone_t = phone_t
+            self.clock.append((arrival, arrival - phone_t))
+            while self.clock and arrival - self.clock[0][0] > CLOCK_WINDOW_S:
+                self.clock.popleft()
+            offset = min(d for _, d in self.clock)
+            at = min(arrival, phone_t + offset)
+            at = max(at, self.last_frame_at + 1e-4)  # keep time moving forward
+        self.last_frame_at = at
+
         pts, w, h = phone_points(msg)
         self.engine.process(pts, w, h, at)
 
@@ -216,6 +276,7 @@ class GestureService:
                 now = time.perf_counter()
                 silent = now - self.phone_last_at
                 if silent > PHONE_GAP_S and self.engine is not None:
+                    self.last_frame_at = max(self.last_frame_at, now)
                     self.engine.process(None, 1280, 720, now)  # counts as "no hand": pointer holds, then hides
                 if silent > PHONE_SILENT_S and not warned:
                     warned = True
@@ -226,8 +287,12 @@ class GestureService:
                 if now - win_start >= 1.0:
                     latency = round(statistics.median(self.latencies), 1) if self.latencies else None
                     self._publish_status(fps=round(self.phone_count / (now - win_start), 1),
-                                         detect_ms=self.phone_detect_ms, latency_ms=latency)
+                                         detect_ms=self.phone_detect_ms, latency_ms=latency,
+                                         gap_phone_ms=round(self.gap_phone * 1000) if self.last_phone_t is not None else None,
+                                         gap_net_ms=round(self.gap_net * 1000) if self.phone_count else None,
+                                         **held_report(self.engine))
                     win_start, self.phone_count = now, 0
+                    self.gap_phone = self.gap_net = 0.0
         except asyncio.CancelledError:
             pass
         finally:
@@ -313,7 +378,8 @@ class GestureService:
                 if read_at - win_start >= 1.0:  # report the real speed once per second
                     latency = round(statistics.median(self.latencies), 1) if self.latencies else None
                     self._publish_status(fps=round(win_frames / (read_at - win_start), 1),
-                                         detect_ms=round(win_ms / win_frames, 1), latency_ms=latency)
+                                         detect_ms=round(win_ms / win_frames, 1), latency_ms=latency,
+                                         **held_report(engine))
                     win_start, win_frames, win_ms = read_at, 0, 0.0
         finally:
             reader.release()

@@ -175,7 +175,7 @@ function showPointer(m) {
   pointerEl.className = (m.drag ? 'drag' : m.hover ? 'hover' : (m.gesture === 'pinch' || m.gesture === 'open_palm' ? m.gesture : ''))
     + (m.held ? ' held' : '');
 }
-// ---------- Grab handles: corners (move a corner), side middles (resize), centre (move all) ----------
+// ---------- Grab handles: corners (move one corner), sides (move one side), inside (move all) ----------
 const handlesEl = document.getElementById('handles');
 let handState = { show: false, hover: null, drag: null };
 let handlesHideTimer = null;
@@ -189,11 +189,19 @@ function drawHandles() {
   const q = scene.corners.map(([x, y]) => [x * W, y * H]);
   const active = handState.drag || handState.hover;
   const dragging = !!handState.drag;
-  // Outline of the shape, brighter while moving or resizing the whole shape.
-  const whole = active === 'body' || (active || '').startsWith('edge');
+  // Outline of the shape, brighter while moving the whole shape.
+  const whole = active === 'body';
   g.lineWidth = whole ? 4 : 2;
   g.strokeStyle = whole ? (dragging ? '#FFFFFF' : '#45D9F5') : 'rgba(69,217,245,0.6)';
   g.beginPath(); q.forEach(([x, y], i) => (i ? g.lineTo(x, y) : g.moveTo(x, y))); g.closePath(); g.stroke();
+  // A targeted side lights up along its whole length (only that side moves).
+  for (let i = 0; i < 4; i++) {
+    if (active !== 'edge:' + i) continue;
+    const a = q[i], b = q[(i + 1) % 4];
+    g.lineWidth = 7; g.lineCap = 'round';
+    g.strokeStyle = dragging ? '#FFFFFF' : '#45D9F5';
+    g.beginPath(); g.moveTo(a[0], a[1]); g.lineTo(b[0], b[1]); g.stroke();
+  }
   const dot = (x, y, r, on, square) => {
     g.lineWidth = 3;
     g.fillStyle = on ? (dragging ? '#FFFFFF' : '#45D9F5') : 'rgba(144,101,255,0.85)';

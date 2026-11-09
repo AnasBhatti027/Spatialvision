@@ -48,7 +48,7 @@ const Tracker = memo(function Tracker({ T, send, mirror, rot, onError }: Props &
         ? hand.flatMap((p: any) => [r4(Number(p.x)), r4(Number(p.y))])
         : null;
       sendRef.current({
-        type: 'hand', pts: flat,
+        type: 'hand', pts: flat, t: Date.now(), // phone's time of this frame, so Wi-Fi bursts do not jerk the pointer
         w: r?.imageWidth ?? 0, h: r?.imageHeight ?? 0,
         mirror: cfg.current.mirror, rot: cfg.current.rot,
       });

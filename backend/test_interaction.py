@@ -10,7 +10,7 @@ import math
 import random
 import statistics
 
-from vision.interaction import (BoundaryEditor, OneEuroFilter2D, PointerTracker, palm_in_picture,
+from vision.interaction import (BoundaryEditor, OneEuroFilter2D, PinchLock, PointerTracker, palm_in_picture,
                                 screen_dist)
 
 FPS, DT = 30, 1 / 30
@@ -60,6 +60,21 @@ for name, (cx, cy), want in [("top-left", (l, t), (0, 0)), ("top-right", (r, t),
     reached.append(palm_in_picture(pts) and screen_dist(tv, want) < 0.01)
 check("all 4 TV corners reachable with the palm in view", all(reached),
       f"camera area x {l:.2f}-{r:.2f}, y {t:.2f}-{b:.2f}")
+
+# 1c. A lopsided hand (little-finger knuckle reaching far to one side, as with a right hand in the
+#     mirrored phone camera): every TV corner is still reachable with all four knuckles in the picture.
+def lopsided(cx, cy):
+    pts = hand(cx, cy)
+    pts[13] = (cx + 0.08, cy + 0.01)
+    pts[17] = (cx + 0.13, cy + 0.03)  # much further out than the standard test hand
+    return pts
+ptl = PointerTracker()
+for i in range(60):
+    ptl.update(lopsided(0.5, 0.45), W, H, i * DT)
+l2, r2, t2, b2 = ptl.area.bounds()
+ok = all(palm_in_picture(lopsided(cx, cy)) for cx, cy in [(l2, t2), (r2, t2), (r2, b2), (l2, b2)])
+check("lopsided hand: all 4 corners reachable with the knuckles in view", ok,
+      f"camera area x {l2:.2f}-{r2:.2f} (more room on the little-finger side)")
 
 # 1b. Bottom corners with the wrist below the picture (seen in the 9 Nov camera test): still followed.
 pt1b = PointerTracker(); pt1b.area = pt.area
@@ -195,12 +210,58 @@ check("pinch outside the shape changes nothing", q == Q and not rel)
 e = BoundaryEditor()
 q, _ = run(e, Q, [((0.5, 0.5), True)] * 3 + [((0.55, 0.45), True)] * 3 + [((0.55, 0.45), False)] * 3)
 check("pinch inside moves the whole shape", abs(q[0][0] - 0.15) < 1e-9 and abs(q[2][1] - 0.85) < 1e-9)
+# 12b. Sides: grabbing a side anywhere along it moves ONLY that side; the opposite side stays put.
+names = ["top", "right", "bottom", "left"]
+grab = [(0.35, 0.1), (0.9, 0.62), (0.7, 0.9), (0.1, 0.3)]          # points on each side, not the middle
+move = [(0.03, 0.08), (-0.15, 0.04), (-0.02, -0.1), (0.12, -0.05)]  # hand moves (with some sideways drift)
+ok_all, detail = True, []
+for i in range(4):
+    e = BoundaryEditor()
+    e.update(grab[i], False, Q, 0)
+    hovered = e.hover == ("edge", i)
+    g, (mx, my) = grab[i], move[i]
+    q, rel = run(e, Q, [(g, True)] * 3 + [((g[0] + mx, g[1] + my), True)] * 3 + [((g[0] + mx, g[1] + my), False)] * 3)
+    j = (i + 1) % 4
+    moving = {i, j}
+    fixed = all(q[k] == Q[k] for k in range(4) if k not in moving)
+    if i in (0, 2):  # top / bottom: only up-down, by the hand's up-down movement
+        good = all(abs(q[k][0] - Q[k][0]) < 1e-9 and abs(q[k][1] - (Q[k][1] + my)) < 1e-9 for k in moving)
+    else:            # left / right: only sideways
+        good = all(abs(q[k][1] - Q[k][1]) < 1e-9 and abs(q[k][0] - (Q[k][0] + mx)) < 1e-9 for k in moving)
+    ok_all &= hovered and fixed and good and rel
+    detail.append(f"{names[i]}: {'ok' if hovered and fixed and good and rel else 'FAILED'}")
+check("each side moves alone, opposite side fixed, no scaling", ok_all, ", ".join(detail))
+
+# 12c. Near a corner, the corner wins over the two sides that meet there.
 e = BoundaryEditor()
-q, _ = run(e, Q, [((0.9, 0.5), True)] * 3 + [((0.7, 0.5), True)] * 3 + [((0.7, 0.5), False)] * 3)
-check("side handle resizes the shape", abs(q[1][0] - 0.7) < 1e-6 and abs(q[0][0] - 0.3) < 1e-6)
+e.update((0.12, 0.11), False, Q, 0)
+check("corner wins where sides meet", e.hover == ("corner", 0), str(e.hover))
+
+# 12d. A side cannot be pushed off the screen.
+e = BoundaryEditor()
+q, _ = run(e, Q, [((0.5, 0.1), True)] * 3 + [((0.5, -0.5), True)] * 3 + [((0.5, -0.5), False)] * 3)
+check("side stops at the screen edge", abs(q[0][1]) < 1e-9 and abs(q[1][1]) < 1e-9 and q[2] == Q[2], f"top side at y={q[0][1]:.3f}")
 e = BoundaryEditor()
 q, _ = run(e, Q, [((0.1, 0.1), True)] * 3 + [((0.95, 0.95), True)] * 3 + [((0.95, 0.95), False)] * 3)
 check("shape never folds over", q == Q)
+
+# 13. Pinch lock: the hand drifts 0.02 while the fingers close; the pointer stays where it was before.
+lk = PinchLock()
+for i in range(10):
+    lk.update((0.5, 0.5), False, i * DT)
+t0 = 10 * DT
+lk.update((0.51, 0.5), False, t0)            # fingers start closing, hand drifts
+lk.update((0.52, 0.5), False, t0 + DT)
+locked = [lk.update((0.52 + 0.002 * k, 0.5), True, t0 + (2 + k) * DT) for k in range(4)]  # pinch seen, still settling
+check("pinch locks the pointer where it was", all(abs(p[0] - 0.5) < 1e-9 for p in locked), f"{[round(p[0], 3) for p in locked]}")
+moved = [lk.update((0.528 + 0.01 * k, 0.5), True, t0 + (6 + k) * DT) for k in range(5)]
+check("after settling, the pointer moves exactly as much as the hand",
+      abs((moved[-1][0] - moved[-2][0]) - 0.01) < 1e-9 and moved[-1][0] < 0.5 + 0.04 + 1e-9,
+      f"hand moved 0.010, pointer moved {moved[-1][0] - moved[-2][0]:.3f}, now {moved[-1][0]:.3f}")
+after = lk.update((0.568, 0.5), False, t0 + 11 * DT)
+check("letting go does not jump", abs(after[0] - moved[-1][0]) < 0.005, f"{moved[-1][0]:.3f} -> {after[0]:.3f}")
+glide = [lk.update((0.568, 0.5), False, t0 + (12 + k) * DT)[0] for k in range(30)]
+check("pointer glides back onto the hand", abs(glide[-1] - 0.568) < 0.003, f"{glide[-1]:.3f}")
 
 print()
 print("All checks passed" if not failures else f"{len(failures)} check(s) failed: {failures}")
