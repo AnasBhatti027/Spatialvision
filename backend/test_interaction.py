@@ -259,27 +259,146 @@ e = BoundaryEditor()
 q, _ = run(e, Q, [((0.1, 0.1), True)] * 3 + [((0.95, 0.95), True)] * 3 + [((0.95, 0.95), False)] * 3)
 check("shape never folds over", q == Q)
 
-# 13. Strict pinch lock.
-#   a) The hand drifts while the fingers close: the pointer stays where it was before the pinch.
-#   b) Pinch held, nothing grabbed: the pointer does not move at all, even when the hand does.
-#   c) Pinch on a handle (dragging): tremor up to DRAG_DEADZONE is ignored, beyond that it follows.
-from vision.interaction import DRAG_DEADZONE, StillLock
+# 13. Pinch = capture and lock (the spec of 10 Nov). Checks the actual pointer coordinates.
+from vision.interaction import DRAG_START, DRAG_STOP_S, GUARD_MAX_S, LOCK_SETTLE_S, RELEASE_SETTLE_S, StillLock
+_r = __import__("random").Random(7)  # own random numbers, so the later checks get the same noise as before
+lk = PinchLock()
+track = [lk.update((0.3 + 0.01 * i, 0.5), False, i * DT) for i in range(20)]
+check("tracking: the pointer follows the hand", abs(track[-1][0] - 0.49) < 1e-9, f"{track[-1]}")
+t0 = 20 * DT
+shown_before = track[-1]
+first = lk.update((0.50 + 0.004, 0.5 + 0.003), True, t0)   # fingers touch; this frame the hand also wobbled
+check("pinch captures the pointer exactly as it was shown (not an older or later spot)", first == shown_before, f"{shown_before} -> {first}")
+check("pinch: the lock is on", lk.locked and lk.lock_point == shown_before)
+# The whole pinch: noise, drift, a big hand movement, unclear frames. The pointer must not change at all.
+pts = []
+for k in range(1, 80):
+    hand = (0.5 + 0.2 * k / 80 + _r.gauss(0, 0.004), 0.5 + _r.gauss(0, 0.004))
+    pts.append(lk.update(hand, None if k % 9 == 0 else True, t0 + k * DT))
+check("locked for the whole pinch: noise, drift, movement and unclear frames change nothing", all(p == shown_before for p in pts),
+      f"{len(set(pts))} different position(s) over {len(pts)} frames")
+check("the captured coordinates themselves never changed", lk.lock_point == shown_before)
+# Release: unlock, glide back onto the hand (no jump), then follow normally.
+hand = (0.72, 0.5)
+rel = lk.update(hand, False, t0 + 80 * DT)
+check("release unlocks", not lk.locked and lk.drag_point is None)
+check("release: the pointer stays exactly where it was locked (no slide, no jump)", rel == shown_before, f"{shown_before} -> {rel}")
+still_after = [lk.update(hand, False, t0 + (81 + k) * DT) for k in range(20)]
+check("after release, a still hand: the pointer does not move by itself", all(p == shown_before for p in still_after))
+moving = [lk.update((hand[0] - 0.01 * k, hand[1]), False, t0 + (101 + k) * DT) for k in range(1, 6)]
+check("after release it carries on from there, moving the same way as the hand", all(b[0] < a[0] for a, b in zip([shown_before] + moving, moving)),
+      f"{shown_before[0]:.3f} -> {moving[0][0]:.3f}")
+far = [lk.update((0.3 + 0.004 * k, 0.5), False, t0 + (106 + k) * DT) for k in range(150)]
+far = far + [lk.update((0.896 - 0.004 * k, 0.5), False, t0 + (256 + k) * DT) for k in range(100)]
+check("...and rejoins the hand as it keeps moving", abs(far[-1][0] - (0.896 - 0.004 * 99)) < 0.01, f"pointer {far[-1][0]:.3f}, hand {0.896 - 0.004 * 99:.3f}")
+# Repeated pinch / release cycles.
+ok = True
+for c in range(5):
+    base_t = t0 + (130 + c * 40) * DT
+    sh = lk.update((0.4 + 0.02 * c, 0.4), False, base_t)
+    for k in range(10):
+        sh = lk.update((0.4 + 0.02 * c, 0.4), False, base_t + (k + 1) * DT)
+    cap = lk.update((0.4 + 0.02 * c + 0.01, 0.41), True, base_t + 11 * DT)
+    held = [lk.update((0.4 + 0.02 * c + 0.05 * k / 10, 0.42), True, base_t + (12 + k) * DT) for k in range(10)]
+    ok = ok and cap == sh and all(p == cap for p in held)
+    lk.update((0.4 + 0.02 * c, 0.4), False, base_t + 23 * DT)
+check("five pinch/release cycles: each captures and locks exactly", ok)
+
+# Pinch on a corner (grabbed): the dot rides on the corner. Wobble and drift move nothing; deliberate
+# movement moves dot and corner together; when the hand pauses, both hold still.
 lk = PinchLock()
 for i in range(10):
-    lk.update((0.5, 0.5), False, i * DT)
+    lk.update((0.5, 0.5), False, i * DT, ratio=1.0)
 t0 = 10 * DT
-lk.update((0.51, 0.5), False, t0)            # fingers start closing, hand drifts
-lk.update((0.52, 0.5), False, t0 + DT)
-locked = [lk.update((0.52 + 0.002 * k, 0.5), True, t0 + (2 + k) * DT) for k in range(4)]
-check("pinch locks the pointer where it was before the fingers closed", all(abs(p[0] - 0.5) < 1e-9 for p in locked), f"{[round(p[0], 3) for p in locked]}")
-frozen = [lk.update((0.53 + 0.01 * k, 0.51), True, t0 + (6 + k) * DT) for k in range(20)]
-check("pinch with nothing grabbed: pointer does not move at all", all(p == (0.5, 0.5) for p in frozen), f"hand moved 0.2, pointer {frozen[-1]}")
-small = [lk.update((0.53 + 0.003 * k, 0.51), True, t0 + (26 + k) * DT, dragging=True) for k in range(3)]
-check("dragging: small tremor is ignored", all(p == (0.5, 0.5) for p in small), f"{small[-1]}")
-big = lk.update((0.53 + 0.05, 0.51), True, t0 + 30 * DT, dragging=True)
-check("dragging: a real movement moves it (minus the tremor allowance)", abs(big[0] - (0.5 + 0.05 - DRAG_DEADZONE)) < 0.002, f"{big[0]:.3f}")
-after = lk.update((0.58, 0.51), False, t0 + 31 * DT)
-check("letting go glides back to the hand (no jump)", abs(after[0] - big[0]) < 0.01, f"{big[0]:.3f} -> {after[0]:.3f}")
+cap = lk.update((0.5, 0.5), True, t0, dragging=True, ratio=0.1)
+settle = [lk.update((0.5 + 0.004 * k, 0.5), True, t0 + k * DT, dragging=True, ratio=0.1) for k in range(1, int(LOCK_SETTLE_S / DT))]
+check("grab: fingers closing move nothing", lk.drag_point == cap and all(p == cap for p in settle))
+t1 = t0 + int(LOCK_SETTLE_S / DT) * DT
+drift = [lk.update((0.5 + 0.0015 * k, 0.5 + 0.001 * k), True, t1 + k * DT, dragging=True, ratio=0.1) for k in range(12)]
+check("grab: slow drift while holding moves neither dot nor corner", lk.drag_point == cap and all(p == cap for p in drift), f"{drift[-1]}")
+h0 = (0.5 + 0.0165, 0.5 + 0.011)
+go = [lk.update((h0[0] + DRAG_START * 1.5 + 0.01 * k, h0[1]), True, t1 + (12 + k) * DT, dragging=True, ratio=0.1) for k in range(8)]
+check("grab: moving the hand moves the corner, and the dot rides on it", go[-1] == lk.drag_point and lk.drag_point[0] > 0.56, f"{lk.drag_point}")
+stop = [lk.update((h0[0] + DRAG_START * 1.5 + 0.07 + 0.004 * ((-1) ** k), h0[1]), True, t1 + (20 + k) * DT, dragging=True, ratio=0.1) for k in range(int(DRAG_STOP_S / DT) + 8)]
+dp = lk.drag_point
+more = [lk.update((h0[0] + DRAG_START * 1.5 + 0.07 + 0.004 * ((-1) ** k), h0[1] + 0.003), True, t1 + (40 + k) * DT, dragging=True, ratio=0.1) for k in range(6)]
+check("grab: when the hand pauses, dot and corner hold still (wobble ignored)", lk.drag_point == dp and all(p == dp for p in more), f"{dp} -> {lk.drag_point}")
+rel = [lk.update((dp[0] + 0.02 * k, dp[1]), False, t1 + (46 + k) * DT, ratio=1.3) for k in range(int(RELEASE_SETTLE_S / DT) + 1)]
+check("grab: letting go, the dot stays on the dropped corner (no slide, no jump)", all(p == dp for p in rel), f"{rel[-1]}")
+
+# 13a. The fault in the logs of 10 Nov 17:03: the dot moved 2-10% of the screen while the fingers were
+#      closing, before the pinch was recognised. Now it is frozen from the moment they start closing.
+lk = PinchLock()
+for i in range(10):
+    aim = lk.update((0.5, 0.47), False, i * DT, ratio=1.45)
+t0 = 10 * DT
+# The real sequence of pinch 2 in that log: gap 1.45 -> 0.32 -> 0.14 -> 0.07 while the hand shifted (0.05, -0.10).
+closing = [lk.update(h, False, t0 + k * DT, ratio=r) for k, (h, r) in enumerate([((0.508, 0.436), 0.321), ((0.532, 0.396), 0.137), ((0.547, 0.374), 0.074)])]
+check("fingers closing: the dot does not move at all (hand shifted 10% of the screen)", all(p == aim for p in closing), f"aimed at {aim}, shown {closing}")
+got = lk.update((0.552, 0.365), True, t0 + 3 * DT, ratio=0.11)
+check("pinch locks exactly where the dot was aimed before the fingers closed", got == aim and lk.lock_point == aim, f"{got}")
+held = [lk.update((0.552 + 0.002 * k, 0.36), True, t0 + (4 + k) * DT, ratio=0.11) for k in range(30)]
+check("...and stays there for the whole pinch", all(p == aim for p in held))
+# Letting go: the fingers open and the hand shifts back. The dot must not move.
+t1 = t0 + 34 * DT
+opening = [lk.update(h, False, t1 + k * DT, ratio=r) for k, (h, r) in enumerate([((0.54, 0.40), 0.7), ((0.52, 0.44), 1.2), ((0.50, 0.47), 1.45)])]
+rest = [lk.update((0.5, 0.47), False, t1 + (3 + k) * DT, ratio=1.45) for k in range(30)]
+check("letting go: the dot stays exactly in place while the fingers open and after", all(p == aim for p in opening + rest),
+      f"{len(set(opening + rest))} position(s)")
+step = lk.update((0.51, 0.47), False, t1 + 34 * DT, ratio=1.45)
+check("then it follows the hand again from that spot", abs(step[0] - 0.51) < 1e-6 and abs(step[1] - 0.47) < 1e-6, f"{step}")
+# Fingers come together a little but no pinch follows (hand keeps moving): a short pause, then on, no jump.
+lk = PinchLock()
+for i in range(10):
+    p0 = lk.update((0.3 + 0.005 * i, 0.5), False, i * DT, ratio=1.0)
+dip = [lk.update((0.35 + 0.005 * k, 0.5), False, (10 + k) * DT, ratio=0.5) for k in range(3)]
+back = lk.update((0.365, 0.5), False, 13 * DT, ratio=1.0)
+on = lk.update((0.375, 0.5), False, 14 * DT, ratio=1.0)
+check("fingers nearly together without a pinch: no jump, then it moves on with the hand", all(p == p0 for p in dip) and back == p0 and on[0] > p0[0], f"{p0} {back} {on}")
+lk = PinchLock()
+for i in range(10):
+    p0 = lk.update((0.3, 0.5), False, i * DT, ratio=1.0)
+n = int(GUARD_MAX_S / DT) + 12
+slow = [lk.update((0.3 + 0.004 * k, 0.5), False, (10 + k) * DT, ratio=0.5) for k in range(n)]
+check("hand held half closed while moving: the dot waits at most GUARD_MAX_S, then follows", slow[int(GUARD_MAX_S / DT) - 2] == p0 and slow[-1][0] > p0[0] + 0.02,
+      f"after {n * DT:.2f} s the dot is at {slow[-1][0]:.3f}")
+# After a drag, at a screen edge: the dot does not get stuck there.
+lk = PinchLock()
+for i in range(5):
+    lk.update((0.9, 0.5), False, i * DT, ratio=1.0)
+lk.update((0.9, 0.5), True, 5 * DT, ratio=0.1)
+for k in range(10):
+    lk.update((0.9 - 0.04 * k, 0.5), True, (6 + k) * DT, ratio=0.1)                     # pinch on nothing: hand moves 0.36 left, the dot stays at 0.9
+for k in range(10):
+    lk.update((0.54, 0.5), False, (16 + k) * DT, ratio=1.2)                             # let go, hand still
+for k in range(1, 21):
+    e = lk.update((0.54 + 0.02 * k, 0.5), False, (26 + k) * DT, ratio=1.2)              # hand comes back right: the dot reaches the edge
+turn = lk.update((0.94 - 0.02, 0.5), False, 47 * DT, ratio=1.2)
+check("at the screen edge the dot turns back at once with the hand (not stuck)", e[0] == 1.0 and turn[0] < 1.0, f"edge {e[0]}, after turning back {turn[0]:.3f}")
+
+# 13c. The top-edge moment in the video of 10 Nov 17:58: mid-drag, two frames look like open fingers.
+#      The editor holds the edge still on such frames, so the dot riding on it must hold still too,
+#      and when the pinch is clear again both carry on together without a jump.
+lk = PinchLock()
+for i in range(8):
+    lk.update((0.45, 0.15), False, i * DT, ratio=1.0)
+t0 = 8 * DT
+cap = lk.update((0.45, 0.15), True, t0, dragging=True, moving_ok=True, ratio=0.15)
+for k in range(1, 6):
+    lk.update((0.45, 0.15), True, t0 + k * DT, dragging=True, moving_ok=True, ratio=0.15)
+for k in range(6, 14):
+    dot = lk.update((0.45, 0.15 + 0.02 * (k - 5)), True, t0 + k * DT, dragging=True, moving_ok=True, ratio=0.15)
+before_gap = dot
+gap = [lk.update((0.45, 0.31 - 0.05 * j), True, t0 + (14 + j) * DT, dragging=True, moving_ok=False, ratio=0.7) for j in range(2)]
+check("open-looking frames mid-drag: the dot holds still with the edge", all(p == before_gap for p in gap), f"{before_gap} -> {gap}")
+resume = lk.update((0.45, 0.21), True, t0 + 16 * DT, dragging=True, moving_ok=True, ratio=0.15)
+check("pinch clear again: no jump", resume == before_gap, f"{before_gap} -> {resume}")
+on = lk.update((0.45, 0.17), True, t0 + 17 * DT, dragging=True, moving_ok=True, ratio=0.15)
+check("...then dot and edge carry on together from there", abs(on[1] - (before_gap[1] - 0.04)) < 1e-9, f"{on}")
+# Release: the fingers open (frames not clearly a pinch), the hand moves: the dot stays on the dropped edge.
+rel = [lk.update((0.45 + 0.01 * j, 0.17 + 0.01 * j), True, t0 + (18 + j) * DT, dragging=True, moving_ok=False, ratio=0.8) for j in range(3)]
+rel += [lk.update((0.48 + 0.01 * j, 0.20), False, t0 + (21 + j) * DT, ratio=0.9) for j in range(int(RELEASE_SETTLE_S / DT))]
+check("letting go: the dot stays exactly on the dropped edge", all(p == on for p in rel), f"{on} -> {rel[-1]}")
 
 # 13b. Still lock: a trembling but still hand gives a pointer that does not move at all,
 #      a clear movement unlocks it without a jump.

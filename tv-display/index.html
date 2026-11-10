@@ -26,6 +26,9 @@
   #pointer.open_palm { border-color: #9065FF; background: rgba(144,101,255,0.25); }
   #pointer.hover { border-color: #FFFFFF; }
   #pointer.drag { width: 16px; height: 16px; margin: -8px 0 0 -8px; background: #FFFFFF; border-color: #45D9F5; }
+  /* Pinch: the pointer is captured and locked at this exact spot until the pinch ends. */
+  #pointer.locked { width: 22px; height: 22px; margin: -11px 0 0 -11px; background: #45D9F5; border: 3px solid #FFFFFF;
+    box-shadow: 0 0 0 4px rgba(69,217,245,0.45); transition: none; }
   /* Grab handles on the shape, shown while the hand is in view. */
   #handles { position: fixed; inset: 0; pointer-events: none; z-index: 4; }
   #event { position: fixed; left: 50%; bottom: 28px; transform: translateX(-50%); padding: 8px 18px; border-radius: 20px;
@@ -272,7 +275,7 @@ function applyScene(m) {
       scene.surfaces[0] || {}, m);
     m = { surfaces: [one], selected: one.id, blackout: false };
   }
-  scene = { type: 'scene', surfaces: m.surfaces, selected: m.selected, blackout: !!m.blackout };
+  scene = { type: 'scene', surfaces: m.surfaces, selected: m.selected, blackout: !!m.blackout, guides: !!m.guides };
   const sel = selectedSurface();
   if (sel) cornersTarget(sel.id, sel.corners);
   needsDraw = true;
@@ -314,6 +317,14 @@ function showPointer(m) {
   }
   clearTimeout(hideTimer); hideTimer = null;
   pointerEl.style.display = 'block';
+  if (m.locked) {
+    // Pinch: the backend captured the pointer. Show exactly those coordinates at once (no glide, no
+    // prediction), and keep them until it says the pinch is over.
+    motion.target = [m.x, m.y]; motion.shown = [m.x, m.y]; motion.vel = [0, 0]; motion.at = performance.now() / 1000;
+    pointerEl.style.transform = `translate3d(${m.x * window.innerWidth}px, ${m.y * window.innerHeight}px, 0)`;
+    pointerEl.className = 'locked' + (m.held ? ' held' : '');
+    return;
+  }
   pointerTarget(m.x, m.y, !!m.still);  // the dot glides there (see "Smooth motion" below)
   pointerEl.className = (m.drag ? 'drag' : m.hover ? 'hover' : (m.gesture === 'pinch' || m.gesture === 'open_palm' ? m.gesture : ''))
     + (m.held ? ' held' : '');
@@ -333,6 +344,7 @@ function drawHandles() {
   const g = handlesEl.getContext('2d');
   g.setTransform(dpr, 0, 0, dpr, 0, 0);
   g.clearRect(0, 0, W, H);
+  if (scene.guides) drawGuides(g, W, H);
   if (!handState.show) return;
   const q = shownCorners().map(([x, y]) => [x * W, y * H]);
   const active = handState.drag || handState.hover;
@@ -363,6 +375,36 @@ function drawHandles() {
     dot((a[0] + b[0]) / 2, (a[1] + b[1]) / 2, active === 'edge:' + i ? 11 : 7, active === 'edge:' + i, true);
   }
   q.forEach(([x, y], i) => dot(x, y, active === 'corner:' + i ? 20 : 13, active === 'corner:' + i, false));
+}
+// "Outlines on TV" (Guides in the editor): every surface's outline, corner numbers and name, so you can
+// see on the real object which surface is which while lining them up. The selected one is cyan.
+function drawGuides(g, W, H) {
+  for (const surf of scene.surfaces) {
+    const sel = surf.id === scene.selected;
+    const corners = sel ? shownCorners() : surf.corners;
+    const warp = warpFn(surf, corners);
+    if (!warp) continue;
+    const outline = surf.mask || [[0, 0], [1, 0], [1, 1], [0, 1]], k = surf.mesh ? 8 : 1, path = [];
+    outline.forEach((a, i) => {
+      const b = outline[(i + 1) % outline.length];
+      for (let j = 0; j < k; j++) path.push(warp(a[0] + ((b[0] - a[0]) * j) / k, a[1] + ((b[1] - a[1]) * j) / k));
+    });
+    g.setLineDash(surf.visible ? [] : [10, 8]);
+    g.lineWidth = sel ? 3 : 2;
+    g.strokeStyle = sel ? '#45D9F5' : 'rgba(144,101,255,0.9)';
+    g.beginPath(); path.forEach(([x, y], i) => (i ? g.lineTo(x * W, y * H) : g.moveTo(x * W, y * H))); g.closePath(); g.stroke();
+    g.setLineDash([]);
+    g.fillStyle = sel ? '#45D9F5' : '#C9B8FF';
+    g.font = 'bold 18px system-ui, sans-serif'; g.textAlign = 'center'; g.textBaseline = 'middle';
+    corners.forEach(([x, y], i) => {
+      g.beginPath(); g.arc(x * W, y * H, 13, 0, Math.PI * 2); g.fill();
+      g.fillStyle = '#080B16'; g.fillText(String(i + 1), x * W, y * H + 1); g.fillStyle = sel ? '#45D9F5' : '#C9B8FF';
+    });
+    const [cx, cy] = warp(0.5, 0.5);
+    g.font = 'bold 22px system-ui, sans-serif';
+    g.lineWidth = 5; g.strokeStyle = 'rgba(8,11,22,0.85)'; g.strokeText(surf.name, cx * W, cy * H);
+    g.fillText(surf.name, cx * W, cy * H);
+  }
 }
 function updateHandles(m) {
   if (m.visible) {

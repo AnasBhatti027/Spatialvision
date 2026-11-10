@@ -49,15 +49,17 @@ def classify(lm, was_pinching: bool = False) -> str:
     """Names the hand shape from the 21 points. Uses distances only, so it works at any hand angle.
     was_pinching: pass True while a pinch is held, so it needs a clearer opening to end."""
     palm = dist(lm[WRIST], lm[MIDDLE_MCP]) or 1e-6
-    # Pinch: thumb and index tips touch while the index finger still reaches forward
-    # (in a fist the thumb also rests near the index tip, but the index is curled back).
-    index_forward = dist(lm[WRIST], lm[INDEX_TIP]) > dist(lm[WRIST], lm[INDEX_PIP])
-    limit = PINCH_RELEASE_RATIO if was_pinching else PINCH_RATIO
-    if index_forward and dist(lm[THUMB_TIP], lm[INDEX_TIP]) / palm < limit:
-        return "pinch"
     # A finger is extended when its tip is further from the wrist than its middle joint.
     fingers = [dist(lm[WRIST], lm[tip]) > dist(lm[WRIST], lm[pip]) * 1.15
                for tip, pip in ((INDEX_TIP, INDEX_PIP), (MIDDLE_TIP, MIDDLE_PIP), (RING_TIP, RING_PIP), (PINKY_TIP, PINKY_PIP))]
+    # Pinch: thumb and index tips touch, and the hand is not a fist (in a fist the thumb also rests near
+    # the curled index tip). "Not a fist" = the index reaches forward, or another finger is extended.
+    # (Before, only the index counted: seen from the phone it often looks curled while pinching, so the
+    # pinch was recognised up to 0.3 s late: logs of 10 Nov 17:03, tips together but "other".)
+    index_forward = dist(lm[WRIST], lm[INDEX_TIP]) > dist(lm[WRIST], lm[INDEX_PIP])
+    limit = PINCH_RELEASE_RATIO if was_pinching else PINCH_RATIO
+    if (index_forward or was_pinching or any(fingers[1:])) and dist(lm[THUMB_TIP], lm[INDEX_TIP]) / palm < limit:
+        return "pinch"
     thumb = dist(lm[THUMB_TIP], lm[PINKY_MCP]) > dist(lm[THUMB_IP], lm[PINKY_MCP]) * 1.1
     if all(fingers) and thumb:
         return "open_palm"

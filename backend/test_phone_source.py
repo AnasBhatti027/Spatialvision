@@ -8,6 +8,7 @@ phone does, grabs corner 1 with a pinch, drags it, lets go, and pauses. It also 
 PC webcam is never opened in phone mode.
 """
 import asyncio
+import math
 import statistics
 import time
 
@@ -90,20 +91,28 @@ async def main():
     check("corner 1 is highlighted", pointers[-1].get("hover") == "corner:0", str(pointers[-1].get("hover")))
 
     # Pinch, drag 0.1 of the TV to the right and down, let go.
+    before = [m for m in hub.tv if m.get("type") == "pointer" and m["visible"]][-1]
+    hub.tv.clear()
     await send(hand(cx, cy, pinch=True), 4)
     for k in range(1, 21):
         await send(hand(cx + k * 0.005 * (r - l), cy + k * 0.005 * (b - t), pinch=True))
     await send(hand(cx + 0.1 * (r - l), cy + 0.1 * (b - t), pinch=True), 4)
-    await send(hand(cx + 0.1 * (r - l), cy + 0.1 * (b - t)), 6)
+    during = [m for m in hub.tv if m.get("type") == "pointer" and m["visible"]]
+    await send(hand(cx + 0.1 * (r - l), cy + 0.1 * (b - t)), 8)
     c1 = hub.scene["corners"][0]
-    # With pointer acceleration a slow drag moves less than the hand (precise), and the first bit of a
-    # pinch-drag is ignored as tremor; what matters is that the corner was moved and dropped near the
-    # pointer (which then rejoins the hand, up to the tremor allowance away).
-    shown = [m for m in hub.tv if m.get("type") == "pointer" and m["visible"]][-1]
-    check("pinch-drag moves corner 1, lands under the pointer, and releases",
-          c1[0] > 0.13 and c1[1] > 0.13 and abs(c1[0] - shown["x"]) < 0.025 and abs(c1[1] - shown["y"]) < 0.025
-          and svc.engine.editor.drag is None,
-          f"corner 1 now {c1[0]:.3f}, {c1[1]:.3f}; pointer {shown['x']:.3f}, {shown['y']:.3f}")
+    after = [m for m in hub.tv if m.get("type") == "pointer" and m["visible"]][len(during):]
+    check("pinch-drag moves corner 1 and releases", c1[0] > 0.13 and c1[1] > 0.13 and svc.engine.editor.drag is None,
+          f"corner 1 now {c1[0]:.3f}, {c1[1]:.3f}")
+    locked = [m for m in during if m.get("locked")]
+    last = during[-1]
+    check("pinch on the corner: the dot starts exactly where it was aimed (no jump)",
+          abs(during[0]["x"] - before["x"]) < 1e-9 and abs(during[0]["y"] - before["y"]) < 1e-9 and len(locked) == len(during),
+          f"{len(locked)}/{len(during)} locked")
+    check("the dot rides on the corner and ends on it", abs(c1[0] - last["x"]) < 0.025 and abs(c1[1] - last["y"]) < 0.025,
+          f"corner {c1[0]:.3f}, {c1[1]:.3f}; dot {last['x']:.3f}, {last['y']:.3f}")
+    check("after letting go the dot stays on the dropped corner (no jump, no slide)",
+          after and all(abs(m["x"] - last["x"]) < 0.002 and abs(m["y"] - last["y"]) < 0.002 for m in after),
+          f"{[(round(m['x'], 3), round(m['y'], 3)) for m in after[:3]]} vs {last['x']:.3f}, {last['y']:.3f}")
     check("other corners unchanged", hub.scene["corners"][1:] == [[0.9, 0.1], [0.9, 0.9], [0.1, 0.9]])
     scene_to_phone = [m for m in hub.phones if m.get("type") == "scene"]
     check("phone gets the shape once, at release (not during the drag)", len(scene_to_phone) == 1, f"{len(scene_to_phone)} update(s)")
@@ -149,6 +158,46 @@ async def main():
     unstamped, stamped = await burst_run(False), await burst_run(True)
     check("Wi-Fi bursts: pointer moves evenly with phone time stamps", stamped < unstamped * 0.5,
           f"unevenness {unstamped:.2f} by arrival time, {stamped:.2f} with phone time")
+
+    # ---- Pinch freeze, from the logs of 10 Nov ----
+    # Pinch in empty space (outside the shape, nothing to grab): the pointer must not move at all,
+    # even when the index finger curls (it was taken for a fist) or one frame looks like open fingers.
+    svc.stop(); await asyncio.sleep(0.1)
+    svc.start(asyncio.get_running_loop()); await asyncio.sleep(0.05)
+    await send(hand(0.5, 0.45, noise=0.002), 45)
+    l, r, t, b = svc.engine.pointer_tracker.area.bounds()
+    ex, ey = l + 0.03 * (r - l), t + 0.5 * (b - t)          # TV (0.03, 0.5): left of the shape
+    await send(hand(ex, ey), 20)
+
+    def curled(cx, cy):  # pinching hard: index tip curled back towards the palm, thumb on it
+        pts = hand(cx, cy, pinch=True)
+        pts[8], pts[4] = (cx - 0.03, cy - 0.03), (cx - 0.035, cy - 0.035)
+        return pts
+
+    hub.tv.clear()
+    await send(hand(ex, ey, pinch=True), 4)
+    await send(curled(ex, ey), 3)
+    await send(hand(ex, ey), 1)                      # one open-looking frame in the middle of the pinch
+    for k in range(10):                              # small hand drift while pinching (tremor)
+        await send(hand(ex + k * 0.0015, ey + k * 0.001, pinch=True))
+    during = [(m["x"], m["y"]) for m in hub.tv if m.get("type") == "pointer" and m["visible"]][4:]
+    moved = max(math.hypot(x - during[0][0], y - during[0][1]) for x, y in during) if during else 1
+    check("pinch on nothing: pointer frozen exactly, through a curled finger and one open frame", moved == 0.0,
+          f"moved {moved:.4f} over {len(during)} frames")
+    check("pinch on nothing grabs nothing", svc.engine.editor.drag is None)
+    await send(hand(ex, ey), 10)
+
+    # Fast move, then pinch: the pointer must not jump back to where the hand was earlier.
+    await send(hand(ex, ey), 10)
+    hub.tv.clear()
+    for k in range(6):
+        await send(hand(ex + k * 0.02, ey))
+    before = [(m["x"], m["y"]) for m in hub.tv if m.get("type") == "pointer" and m["visible"]][-1]
+    await send(hand(ex + 0.10, ey, pinch=True), 3)
+    at_pinch = [(m["x"], m["y"]) for m in hub.tv if m.get("type") == "pointer" and m["visible"]][-1]
+    jump = math.hypot(at_pinch[0] - before[0], at_pinch[1] - before[1])
+    check("pinch after a fast move: no jump back", jump <= 0.035, f"pointer moved {jump:.3f} when the pinch began")
+    await send(hand(ex + 0.10, ey), 10)
 
     svc.stop()
     await asyncio.sleep(0.1)

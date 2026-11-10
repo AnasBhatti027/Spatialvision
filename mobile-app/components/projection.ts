@@ -22,7 +22,7 @@ export type Surface = {
   feather: number;          // soft edge, 0..0.25 of the surface size
   flipX: boolean; flipY: boolean; visible: boolean; locked: boolean;
 };
-export type Scene = { surfaces: Surface[]; selected: string; blackout: boolean };
+export type Scene = { surfaces: Surface[]; selected: string; blackout: boolean; guides: boolean }; // guides: outlines shown on the TV
 
 export const ASPECT = 16 / 9; // the TV's shape
 export const MAX_SURFACES = 8, MAX_MESH = 6, MAX_MASK = 32;
@@ -43,7 +43,7 @@ export function makeSurface(id: string, name: string, corners: Quad = DEFAULT_QU
     fit: 'contain', grid: false, opacity: 1, feather: 0, flipX: false, flipY: false, visible: true, locked: false,
   };
 }
-export const DEFAULT_SCENE: Scene = { surfaces: [makeSurface('s1', 'Surface 1')], selected: 's1', blackout: false };
+export const DEFAULT_SCENE: Scene = { surfaces: [makeSurface('s1', 'Surface 1')], selected: 's1', blackout: false, guides: false };
 
 // ---------- Checking data from the PC (same rules as backend/scene_model.py) ----------
 const isNum = (v: any) => typeof v === 'number' && Number.isFinite(v);
@@ -257,10 +257,15 @@ export function snapPoint(p: Pt, targets: Pt[], tol: number): Pt {
 export function sceneMessage(sc: Scene) {
   // An image that has not finished uploading cannot be shown on the TV yet.
   const surfaces = sc.surfaces.map((s) => ({ ...s, content: s.content === 'image' && !s.image_url ? 'blank' : s.content }));
-  return { type: 'scene', surfaces, selected: sc.selected, blackout: sc.blackout };
+  return { type: 'scene', surfaces, selected: sc.selected, blackout: sc.blackout, guides: sc.guides };
 }
 
 const HISTORY = 40; // undo steps kept (each is a few kilobytes)
+
+// True until the first connection after the app starts. Closing and opening the app starts a fresh
+// projection (one default surface), and the TV is reset to match. A reconnect while the app stays open
+// (for example a short Wi-Fi drop) keeps the work. Saved scenes are still there under Load scene.
+let freshStart = true;
 
 /**
  * Holds the projection scene and sends it to the TV (through the backend) whenever it changes.
@@ -287,7 +292,7 @@ export function useProjectionScene(send: (msg: object) => boolean, connected: bo
   useEffect(() => {
     if (!connected) { synced.current = false; return; }
     // Safety net: if the PC sends no scene within 1.5 s (an older backend), carry on as before.
-    const t = setTimeout(() => { if (!synced.current) { synced.current = true; setSyncTick((n) => n + 1); } }, 1500);
+    const t = setTimeout(() => { if (!synced.current) { synced.current = true; freshStart = false; setSyncTick((n) => n + 1); } }, 1500);
     return () => clearTimeout(t);
   }, [connected]);
 
@@ -386,13 +391,14 @@ export function useProjectionScene(send: (msg: object) => boolean, connected: bo
     return { ...sc, surfaces: list };
   });
   const setBlackout = (on: boolean) => edit((sc) => ({ ...sc, blackout: on }));
+  const setGuides = (on: boolean) => edit((sc) => ({ ...sc, guides: on }));
   /** Back to how a new surface starts: corners, warp points, shape, edges, flips, brightness. Its picture stays. */
   const resetSurface = () => editSelected((x) => {
     const fresh = makeSurface(x.id, x.name);
     return { ...fresh, content: x.content, color: x.color, image_url: x.image_url, fit: x.fit, grid: x.grid };
   });
   /** Everything back to one fresh surface (Undo can bring it back). */
-  const resetScene = () => edit(() => ({ surfaces: [makeSurface('s1', 'Surface 1')], selected: 's1', blackout: false }));
+  const resetScene = () => edit((sc) => ({ surfaces: [makeSurface('s1', 'Surface 1')], selected: 's1', blackout: false, guides: sc.guides }));
   const resetAll = () => { past.current = []; future.current = []; setPreviews({}); commit(DEFAULT_SCENE); past.current = []; };
   const loadScene = (sc: Scene) => commit(sc);
   const setPreview = (id: string, uri: string | null) =>
@@ -404,7 +410,7 @@ export function useProjectionScene(send: (msg: object) => boolean, connected: bo
     let next: Scene;
     if (Array.isArray(m.surfaces) && m.surfaces.length) {
       const surfaces = m.surfaces.slice(0, MAX_SURFACES).map(cleanSurface);
-      next = { surfaces, selected: surfaces.some((x: Surface) => x.id === m.selected) ? m.selected : surfaces[0].id, blackout: m.blackout === true };
+      next = { surfaces, selected: surfaces.some((x: Surface) => x.id === m.selected) ? m.selected : surfaces[0].id, blackout: m.blackout === true, guides: m.guides === true };
     } else {
       // An older backend: one shape at the top level, applied to the selected surface.
       const sel = selectedOf(cur);
@@ -417,7 +423,12 @@ export function useProjectionScene(send: (msg: object) => boolean, connected: bo
       return mine && mine.content === 'image' && !mine.image_url && x.content === 'blank' ? { ...x, content: 'image' } : x;
     }) };
     fromBackend.current = JSON.stringify(sceneMessage(next));
-    if (!synced.current) {  // the first scene after connecting is where the work was left: not an undo step
+    if (!synced.current && freshStart) {  // the app was just opened: start clean and reset the TV too
+      freshStart = false;
+      synced.current = true;
+      // The phone's own scene wins: the clean default, or whatever was changed before connecting.
+      setSyncTick((n) => n + 1); // sends it to the TV
+    } else if (!synced.current) {  // reconnected while the app stayed open: carry on where the TV is
       synced.current = true;
       past.current = []; future.current = [];
       sceneRef.current = next; setScene(next); setHistTick((n) => n + 1);
@@ -430,7 +441,7 @@ export function useProjectionScene(send: (msg: object) => boolean, connected: bo
   return {
     scene, selected, previews, setPreview,
     edit, editSurface, editSelected, select, sendLive,
-    addSurface, duplicateSurface, deleteSurface, moveLayer, setBlackout, loadScene, resetSurface, resetScene,
+    addSurface, duplicateSurface, deleteSurface, moveLayer, setBlackout, setGuides, loadScene, resetSurface, resetScene,
     undo, redo, canUndo: past.current.length > 0, canRedo: future.current.length > 0,
     resetAll, applyRemote,
   };

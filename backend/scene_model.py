@@ -114,11 +114,13 @@ def normalize(raw: dict, prev: dict | None = None) -> dict:
         surfaces = [clean_surface(s, i + 1) for i, s in enumerate(raw["surfaces"][:MAX_SURFACES])]
         selected = raw.get("selected")
         blackout = raw.get("blackout") is True
+        guides = raw.get("guides") is True
     else:
         base = normalize(prev) if prev and prev.get("surfaces") else None
         surfaces = base["surfaces"] if base else [default_surface(1)]
         selected = base["selected"] if base else surfaces[0]["id"]
         blackout = base["blackout"] if base else False
+        guides = base["guides"] if base else False
         surfaces = [dict(s) for s in surfaces]
         i = next((k for k, s in enumerate(surfaces) if s["id"] == selected), 0)
         old = {k: raw[k] for k in MIRRORED if k in raw}
@@ -131,7 +133,7 @@ def normalize(raw: dict, prev: dict | None = None) -> dict:
         seen.add(s["id"])
     if selected not in seen:
         selected = surfaces[0]["id"]
-    scene = {"type": "scene", "surfaces": surfaces, "selected": selected, "blackout": blackout}
+    scene = {"type": "scene", "surfaces": surfaces, "selected": selected, "blackout": blackout, "guides": guides}
     return _mirror(scene)
 
 

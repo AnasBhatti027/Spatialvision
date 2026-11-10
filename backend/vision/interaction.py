@@ -67,10 +67,15 @@ STILL_SPEED = 0.06       # still lock: hand slower than this (TV widths per seco
 STILL_TIME_S = 0.10      # ...for this long locks the pointer exactly in place...
 UNLOCK_DIST = 0.010      # ...until the hand has clearly moved this far (TV widths, about 1% of the screen)
 UNLOCK_GLIDE_S_STILL = 0.08  # after unlocking, the pointer joins the hand over about this time (no jump)
-DRAG_DEADZONE = 0.015    # while pinching a corner or side: hand movement up to this far is ignored (tremor)
+DRAG_START = 0.03        # while pinching a corner, side or the inside: the projection stays put until the hand moves this far
+GUARD_RATIO = 0.6        # thumb-index gap (in palm lengths) below this: the fingers are closing for a pinch
+GUARD_MAX_S = 0.5        # the dot waits this long for the pinch to be recognised; otherwise it carries on
+RELEASE_SETTLE_S = 0.25  # after a pinch the dot stays put this long while the fingers finish opening
+OFFSET_CLOSE = 0.5       # after a pinch, the gap to the hand closes by this share of each hand step
+DRAG_STOP_S = 0.25       # ...and locks again once the hand has moved less than DRAG_STOP_DIST in this time
+DRAG_STOP_DIST = 0.012
 
-LOCK_LOOKBACK_S = 0.10   # pinch lock: the pointer goes back to where it was this long before the pinch was seen
-LOCK_SETTLE_S = 0.15     # ...and stays exactly there while the fingers finish closing
+LOCK_SETTLE_S = 0.15     # pinch: hand movement in this first moment (fingers closing) never moves a grabbed corner
 UNLOCK_GLIDE_S = 0.25    # after letting go, the pointer glides back onto the hand over about this time
 
 
@@ -382,64 +387,144 @@ class StillLock:
 
 
 class PinchLock:
-    """Keeps the pointer exactly where you pinched.
+    """Pinch = the dot is captured and stays exactly where it is. If a corner, side or the inside was
+    under it, the dot rides on that as it is dragged (dot and projection move together), and both hold
+    still whenever the hand pauses.
 
-    Strict: while a pinch is held and nothing is grabbed, the pointer does not move at all. While a
-    corner or side is grabbed, hand movement up to DRAG_DEADZONE is ignored (tremor), and beyond that
-    the pointer (and the grabbed handle) follows the hand smoothly from the spot where you pinched.
+    What the logs of 10 Nov (17:03) showed: the dot moved 2-10% of the screen WHILE THE FINGERS WERE
+    CLOSING, before the pinch was recognised (closing the index finger shifts the hand in the picture,
+    and recognising the pinch took up to 0.3 s). The lock then captured that moved position. So:
 
-    Closing the thumb and finger moves the whole hand a little, and the pinch is only recognised
-    once the fingers touch, so without this the pointer drifts off the spot you aimed at.
-    When a pinch starts, the pointer goes back to where it was just before the fingers started
-    closing and stays there while they settle; after that only real hand movement moves it.
-    When the pinch ends, the pointer glides back onto the hand instead of jumping."""
+    1. Fingers start closing (thumb-index gap drops below GUARD_RATIO): the dot is frozen at once, where
+       it was with the fingers open. If no pinch follows within GUARD_MAX_S, it simply carries on.
+    2. Pinch recognised: locked at that frozen spot for the whole pinch. New frames, noise, hand movement
+       and unclear frames cannot change it. If a corner, side or the inside was under the dot, clear hand
+       movement moves that (drag_point) and the dot goes with it; wobble and slow drift move nothing.
+    3. Pinch ends: the dot stays put while the fingers finish opening (RELEASE_SETTLE_S), then carries on
+       from where it is. It never slides or jumps by itself; the gap to the hand closes only as the hand
+       moves."""
 
     def __init__(self):
-        self.history = deque(maxlen=20)  # (time, pointer) of recent frames
         self.locked = False
-        self.lock_point = None
+        self.lock_point = None           # the captured dot position: shown unchanged for the whole pinch
         self.lock_t = 0.0
-        self.base = None                 # hand position when the settle time ended
-        self.offset = (0.0, 0.0)         # gap between shown pointer and hand after a release
+        self.drag_point = None           # separate position that moves what was grabbed (None = no pinch)
+        self.base = None                 # hand position the drag is measured from
+        self.drag_from = None            # drag_point at that moment
+        self.moving = False              # the hand is clearly moving (else the projection holds still)
+        self.track = deque()             # (time, hand) while grabbing, to notice when the hand stops
+        self.rebase = False              # the drag was paused for unclear frames: restart from the current hand
+        self.grabbed = False
+        self.guard_point = None          # fingers closing: the dot waits here for the pinch
+        self.guard_t = 0.0
+        self.closing = False             # thumb and index are near each other
+        self.was_open = False            # ...and were clearly apart on the frame before
+        self.hold_point = None           # pinch just ended: the dot stays here while the fingers open
+        self.hold_until = 0.0
+        self.offset = (0.0, 0.0)         # gap between the dot and the hand after a pinch
         self.shown = None
-        self.last_t = None
+        self.last_hand = None
 
-    def update(self, pointer, pinch, at: float, dragging: bool = False):
-        """pointer: smoothed pointer or None. pinch: True / False, or None when unknown this frame.
-        dragging: a corner or side is grabbed (then the hand may move it)."""
-        dt = 0.0 if self.last_t is None else max(0.0, at - self.last_t)
-        self.last_t = at
-        if pointer is None:
+    @property
+    def frozen(self) -> bool:
+        """The dot is being kept exactly where it is (closing, pinching, or just released)."""
+        return self.locked or self.guard_point is not None or self.hold_point is not None
+
+    def update(self, pointer, pinch, at: float, dragging: bool = False, moving_ok: bool = True, ratio=None):
+        """pointer: the live (filtered) pointer from the hand, or None when the hand is gone.
+        pinch: True / False, or None when the hand is unclear this frame (the state is kept).
+        dragging: a corner, side or the inside is grabbed. moving_ok: the pinch is clearly seen this frame
+        (only then does the grabbed handle move; otherwise it and the dot hold still together). ratio: thumb-tip to index-tip distance in palm
+        lengths, or None when unknown. Returns the dot position to show."""
+        if pointer is None:              # hand gone for longer than the hold time
             self.__init__()
             return None
-        self.history.append((at, pointer))
-        if pinch is None:          # hand unclear this frame: keep whatever mode we are in
+        if pinch is None:
             pinch = self.locked
+        if ratio is not None:
+            self.closing = ratio < GUARD_RATIO
 
-        if pinch and not self.locked:
-            self.locked, self.lock_t, self.base = True, at, None
-            before = [p for t, p in self.history if t <= at - LOCK_LOOKBACK_S]
-            self.lock_point = before[-1] if before else (self.shown or pointer)
+        if pinch and not self.locked:    # pinch recognised: capture the dot exactly as it is shown now
+            self.locked, self.lock_t = True, at          # (while the fingers were closing it was already frozen)
+            self.lock_point = self.shown or pointer
+            self.drag_point = self.lock_point
+            self.base, self.moving, self.grabbed = None, False, False
+            self.guard_point = self.hold_point = None
         if self.locked and pinch:
-            if at - self.lock_t < LOCK_SETTLE_S or not dragging:
-                self.shown = self.lock_point      # fixed: not a millimetre of movement
-                self.base = None
-            else:
-                if self.base is None:
-                    self.base = pointer
-                dx, dy = pointer[0] - self.base[0], pointer[1] - self.base[1]
-                d = math.hypot(dx, dy / ASPECT)
-                f = 0.0 if d <= DRAG_DEADZONE else (d - DRAG_DEADZONE) / d   # ignore tremor, no jump at the edge
-                self.shown = (clamp01(self.lock_point[0] + dx * f), clamp01(self.lock_point[1] + dy * f))
+            if dragging:
+                self.grabbed = True
+                if moving_ok:
+                    self._drag(pointer, at)
+                else:
+                    self.rebase = True   # paused: when the pinch is clear again, continue from here (no jump)
+            # Nothing grabbed: exactly the captured spot. Grabbed: on the projection (moves only on purpose).
+            self.shown, self.last_hand = (self.drag_point if self.grabbed else self.lock_point), pointer
             return self.shown
-        if self.locked and not pinch:  # released: start from where the pointer was shown
-            self.locked = False
-            last = self.shown or pointer
-            self.offset = (last[0] - pointer[0], last[1] - pointer[1])
-        k = math.exp(-dt / UNLOCK_GLIDE_S) if dt > 0 else 1.0
-        self.offset = (self.offset[0] * k, self.offset[1] * k)
+        if self.locked:                  # pinch ended: the dot stays where it is (on the dropped corner)
+            self.locked, self.drag_point = False, None
+            self.hold_point, self.hold_until = self.shown, at + RELEASE_SETTLE_S
+        if self.hold_point is not None:
+            if at < self.hold_until:     # fingers still opening (that shifts the hand too): stay put
+                self.shown, self.last_hand = self.hold_point, pointer
+                return self.shown
+            self._carry_on(self.hold_point, pointer)
+            self.hold_point = None
+        if self.guard_point is None:
+            if self.closing and self.was_open and self.shown is not None:
+                self.guard_point, self.guard_t = self.shown, at     # fingers start closing: freeze here
+        elif not self.closing or at - self.guard_t > GUARD_MAX_S:    # no pinch came: carry on, no jump
+            self._carry_on(self.guard_point, pointer)
+            self.guard_point = None
+        self.was_open = not self.closing
+        if self.guard_point is not None:
+            self.shown, self.last_hand = self.guard_point, pointer
+            return self.shown
+
+        # Following the hand. A gap left by a pinch closes only while the hand moves: each frame by up to
+        # OFFSET_CLOSE of the hand's step, so the dot always moves the way the hand does and never by itself.
+        if self.last_hand is not None and (self.offset[0] or self.offset[1]):
+            step = math.hypot(pointer[0] - self.last_hand[0], (pointer[1] - self.last_hand[1]) / ASPECT)
+            gap = math.hypot(self.offset[0], self.offset[1] / ASPECT)
+            k = max(0.0, 1.0 - OFFSET_CLOSE * step / gap) if gap > 1e-9 else 0.0
+            self.offset = (self.offset[0] * k, self.offset[1] * k)
+            if math.hypot(*self.offset) < 1e-4:
+                self.offset = (0.0, 0.0)
+        self.last_hand = pointer
         self.shown = (clamp01(pointer[0] + self.offset[0]), clamp01(pointer[1] + self.offset[1]))
+        # At a screen edge the gap gives way (like a mouse), so turning back moves the dot at once.
+        if self.offset[0] or self.offset[1]:
+            self.offset = (self.shown[0] - pointer[0], self.shown[1] - pointer[1])
         return self.shown
+
+    def _carry_on(self, point, hand):
+        """The dot continues from `point` although the hand is elsewhere."""
+        self.offset = (point[0] - hand[0], point[1] - hand[1])
+        self.last_hand = hand
+
+    def _drag(self, hand, at: float):
+        """Moves drag_point (what the editor uses to move the grabbed corner, side or shape) with the
+        hand. The first DRAG_START of movement is ignored, so a held pinch does not shake the projection."""
+        if at - self.lock_t < LOCK_SETTLE_S:   # fingers still settling: nothing moves
+            return
+        gap = lambda a, b: math.hypot(a[0] - b[0], (a[1] - b[1]) / ASPECT)
+        if self.base is None:
+            self.base, self.drag_from, self.moving = hand, self.drag_point, False
+            self.track.clear()
+        elif self.rebase:                # after a pause: carry on from where dot and handle are now
+            self.base, self.drag_from, self.rebase = hand, self.drag_point, False
+            self.track.clear()
+        self.track.append((at, hand))
+        while self.track and self.track[0][0] < at - 2 * DRAG_STOP_S:
+            self.track.popleft()
+        if not self.moving:
+            if gap(hand, self.base) <= DRAG_START:
+                return                                   # wobble or slow drift: nothing moves
+            self.moving = True
+        self.drag_point = (clamp01(self.drag_from[0] + hand[0] - self.base[0]),
+                           clamp01(self.drag_from[1] + hand[1] - self.base[1]))
+        older = [p for t, p in self.track if t <= at - DRAG_STOP_S]
+        if older and gap(hand, older[-1]) < DRAG_STOP_DIST:   # the hand stopped: hold here
+            self.moving, self.drag_from, self.base = False, self.drag_point, hand
 
 
 # ---------------------------------------------------------------- editing the shape

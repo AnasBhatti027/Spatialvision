@@ -29,6 +29,7 @@ from vision.interaction import (PHONE_UPDATE_S, BoundaryEditor, PinchLock, Point
 
 CONTENT_ORDER = ["pattern", "grid", "color", "image", "blank"]
 LOG_DIR = Path(__file__).resolve().parent.parent / "logs"   # backend/logs, one file per gesture session (ignored by git)
+PINCH_RELEASE_S = 0.15    # a pinch ends only after the fingers have been apart this long (no flicker)
 PHONE_GAP_S = 0.35        # no hand message from the phone for this long: treat as "no hand" (short Wi-Fi pauses are normal)
 CLOCK_WINDOW_S = 5.0      # phone-to-PC clock offset: the quickest delivery seen in this window
 PHONE_SILENT_S = 3.0      # ...for this long: tell the phone user the camera stopped sending
@@ -130,6 +131,8 @@ class GestureEngine:
         self.frames = Counter()   # frames per state since the last status report (tracking / holding / lost)
         self.reasons = Counter()  # ...and why the pointer was held
         self.pinching = False           # pinch state with hysteresis (see classify)
+        self.pinch_hold = False         # pinch as the pointer freeze sees it: ends PINCH_RELEASE_S after opening
+        self.open_since = None          # when the fingers opened during a pinch
         self.last_phone_update = 0.0
         self.start = time.perf_counter()
         self.log = GestureLog(service.source or "?")
@@ -150,25 +153,46 @@ class GestureEngine:
         # The pinch only counts while the hand is clearly seen; otherwise it is "unknown",
         # so a short tracking gap never drops or grabs a corner by accident.
         if state == "tracking":
-            self.pinching = raw == "pinch"
-            pinch = self.pinching
+            self.pinching = raw == "pinch"   # for grabbing corners (the editor has its own let-go check)
+            if self.pinching:
+                self.pinch_hold, self.open_since = True, None
+            elif self.pinch_hold:
+                # The pointer stays frozen until the fingers have been apart for PINCH_RELEASE_S.
+                # One open-looking frame used to unfreeze it, so it jumped (logs of 10 Nov).
+                if self.open_since is None:
+                    self.open_since = at
+                if at - self.open_since >= PINCH_RELEASE_S:
+                    self.pinch_hold, self.open_since = False, None
+            pinch, lock_pinch = self.pinching, self.pinch_hold
         else:
-            pinch = None
+            pinch = lock_pinch = None
 
         tracked = pointer
         pointer = self.accel.update(pointer, at)        # slow hand = precise pointer, fast hand = quick pointer
         accel = pointer
-        if not self.pinching:
+        if not (self.pinching or self.pinch_hold):
             pointer = self.still.update(pointer, at)    # hand (nearly) still: pointer exactly still
         else:
             self.still.reset()
-        pointer = self.lock.update(pointer, pinch, at, dragging=self.editor.drag is not None)  # strict pinch lock
+        # Thumb-to-index gap in palm lengths: tells the lock that the fingers are closing, before the pinch
+        # itself is recognised, so the dot can be frozen before the hand shifts (see PinchLock).
+        ratio = None
+        if pts is not None and state == "tracking":
+            ratio = math.dist(pts[4], pts[8]) / (math.dist(pts[0], pts[9]) or 1e-6)
+        # The grabbed handle (and the dot riding on it) only moves on frames where the pinch is clearly
+        # seen. On a frame where the fingers look open or the hand is unclear, the editor holds the handle
+        # still, so the dot must hold still too; otherwise they came apart (video and log of 10 Nov 17:58).
+        pointer = self.lock.update(pointer, lock_pinch, at, dragging=self.editor.drag is not None,
+                                   moving_ok=pinch is True, ratio=ratio)
 
         event = self.tracker.update(raw, pts[INDEX_TIP][0] if pts else None, at)
         gesture = self.tracker.stable
 
         # Editing the shape: hover, grab, drag, release.
-        corners, released = self.editor.update(pointer, pinch, hub.scene["corners"], at)
+        # Hover and grab use the locked pointer, so the corner or side under it when you pinched is the one
+        # grabbed. Moving it uses the separate drag position: the pointer stays locked, only the projection moves.
+        edit_point = self.lock.drag_point if self.editor.drag is not None and self.lock.drag_point else pointer
+        corners, released = self.editor.update(edit_point, pinch, hub.scene["corners"], at)
         if corners is not None:
             # The TV follows every frame. When the phone is the camera, it gets the new shape only
             # once, when the corner is dropped: redrawing its screen during the drag would slow down
@@ -181,8 +205,9 @@ class GestureEngine:
                 self.last_phone_update = at
             svc._change_scene(phones=to_phone, corners=corners)
 
-        still = (self.still.locked is not None and not self.pinching) or (self.lock.locked and self.lock.base is None)
+        still = (self.still.locked is not None and not (self.pinching or self.pinch_hold)) or self.lock.frozen
         svc._send_pointer({"type": "pointer", "visible": pointer is not None, "held": state == "holding", "still": still,
+                           "locked": self.lock.locked,
                            "t": at, "x": pointer[0] if pointer else 0, "y": pointer[1] if pointer else 0,
                            "gesture": "pinch" if self.pinching else gesture,
                            "hover": target_name(self.editor.hover), "drag": target_name(self.editor.drag)})
@@ -190,7 +215,9 @@ class GestureEngine:
         row = {"t": round(at - self.start, 4), "state": state, "why": self.pointer_tracker.reason or None,
                "raw": raw, "pinch": pinch, "tracked": r4(tracked), "accel": r4(accel), "shown": r4(pointer),
                "hover": target_name(self.editor.hover), "drag": target_name(self.editor.drag),
-               "released": bool(released), "w": frame_w, "h": frame_h}
+               "released": bool(released), "w": frame_w, "h": frame_h,
+               "locked": self.lock.locked, "drag_point": r4(self.lock.drag_point),
+               "guard": self.lock.guard_point is not None}
         if pts is not None:
             palm = math.dist(pts[0], pts[9]) or 1e-6
             row["anchor"] = r4(((pts[5][0] + pts[9][0]) / 2, (pts[5][1] + pts[9][1]) / 2))

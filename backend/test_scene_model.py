@@ -65,6 +65,10 @@ kept = normalize({"surfaces": [{"id": "m", "mesh": mesh, "mask": star, "feather"
 check("warp grid kept", kept["surfaces"][0]["mesh"] == mesh)
 check("shape outline kept", kept["surfaces"][0]["mask"] == star and kept["surfaces"][0]["feather"] == 0.05)
 
+# 7b. "Outlines on TV" is kept; anything but true means off
+check("guides kept", normalize({"surfaces": [{"id": "g"}], "guides": True})["guides"] is True)
+check("guides off by default", normalize({"surfaces": [{"id": "g"}], "guides": "yes"})["guides"] is False)
+
 # 8. Saved scenes in SQLite (a temporary database, so your real saved scenes are not touched)
 with tempfile.TemporaryDirectory() as d:
     db = Path(d) / "test.db"
