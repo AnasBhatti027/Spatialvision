@@ -293,6 +293,7 @@ export default function SpatialVisionHome() {
   };
 
   const login = (u: AuthUser) => {
+    setSplash(true);   // after logging in, show the splash screen first, then the interface
     setUser(u);
     setHistory([]);
     setRouteRaw('home');
